@@ -1,0 +1,20 @@
+# Environments
+.venv/
+.venv_broken_dw2471_20260827/
+.venv_broken_old/
+.venv_new/
+.conda/
+
+# Third-party clone (separate repo, see sepsc/README.md Environment section)
+_external/
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / tooling
+.vscode/
+.claude/
