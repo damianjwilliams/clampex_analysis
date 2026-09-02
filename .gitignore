@@ -18,3 +18,8 @@ __pycache__/
 # Editor / tooling
 .vscode/
 .claude/
+
+# Rig/analysis output (per-session data, not code)
+cell_metadata.csv
+*_membrane_test.txt
+membrane_test_qc.png
