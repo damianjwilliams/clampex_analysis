@@ -66,14 +66,22 @@ Usage
     python membrane_test.py recording.abf --channel 0 --sweeps 0-4 --fit 10 80
     python membrane_test.py --selftest        # run synthetic RC validation
 
+Every run writes its measurements to a text file next to the recording,
+``<recording>_membrane_test.txt`` -- the summary, the analysis settings that
+produced it and the per-transient table -- so a rig session leaves a record
+without anyone having to remember a flag. ``--txt PATH`` puts it elsewhere,
+``--no-txt`` skips it.
+
 Requires: numpy, scipy, and (for reading ABFs) pyabf.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -139,6 +147,7 @@ class TransientResult:
 class MembraneTestResult:
     transients: list[TransientResult] = field(default_factory=list)
     first_sweep: dict = field(default_factory=dict)  # arrays kept for plotting
+    source: dict = field(default_factory=dict)       # ABF provenance, for the report
 
     def _agg(self, attr, direction=None):
         vals = [getattr(t, attr) for t in self.transients
@@ -438,18 +447,28 @@ def membrane_test_from_arrays(
 # ----------------------------------------------------------------------------
 # ABF loading
 # ----------------------------------------------------------------------------
-def _warn_acquisition_settings(abf, channel: int) -> None:
-    """Flag telegraphed settings that undermine a Membrane Test measurement."""
+def _acquisition_note(abf, channel: int) -> str:
+    """Telegraphed settings that undermine a Membrane Test measurement, as text
+    ("" if there is nothing to flag). Returned rather than only printed so the
+    saved report carries the same caveat as the terminal."""
     try:
         filt = abf._adcSection.fTelegraphFilter[channel]
     except Exception:
-        return
+        return ""
     if filt and filt < 10_000:
-        print(f"NOTE: channel {channel} was recorded through a {filt:.0f} Hz "
-              f"lowpass filter. The capacitive peak is therefore smoothed, so "
-              f"any peak-based Ra estimate will be too high. Charge (Cm) and a "
-              f"slow tau survive filtering, so the charge-based Ra used here is "
-              f"largely unaffected.", file=sys.stderr)
+        return (f"channel {channel} was recorded through a {filt:.0f} Hz "
+                f"lowpass filter. The capacitive peak is therefore smoothed, so "
+                f"any peak-based Ra estimate will be too high. Charge (Cm) and a "
+                f"slow tau survive filtering, so the charge-based Ra used here is "
+                f"largely unaffected.")
+    return ""
+
+
+def _warn_acquisition_settings(abf, channel: int) -> str:
+    note = _acquisition_note(abf, channel)
+    if note:
+        print(f"NOTE: {note}", file=sys.stderr)
+    return note
 
 
 def membrane_test_from_abf(
@@ -474,7 +493,7 @@ def membrane_test_from_abf(
     abf = pyabf.ABF(path)
     if channel not in abf.channelList:
         raise SystemExit(f"Channel {channel} not in {abf.channelList}")
-    _warn_acquisition_settings(abf, channel)
+    note = _warn_acquisition_settings(abf, channel)
     sweep_list = list(range(abf.sweepCount)) if sweeps is None else sweeps
 
     pooled = MembraneTestResult()
@@ -495,6 +514,20 @@ def membrane_test_from_abf(
             first = dict(time_s=t, current_A=i, command_V=c, result=res)
         pooled.transients.extend(res.transients)
     pooled.first_sweep = first
+    # Header facts the saved report needs; grabbed here because this is the
+    # only place the ABF is open.
+    pooled.source = {
+        "path": str(path),
+        "protocol": getattr(abf, "protocol", "") or "",
+        "recorded": getattr(abf, "abfDateTime", None),
+        "sample_rate_hz": float(getattr(abf, "dataRate", float("nan"))),
+        "channel": channel,
+        "command_channel": command_channel,
+        "sweeps": list(sweep_list),
+        "sweep_count": int(getattr(abf, "sweepCount", 0)),
+        "current_units": getattr(abf, "sweepUnitsY", ""),
+        "acquisition_note": note,
+    }
 
     if not pooled.transients:
         print("WARNING: no command steps detected. Is this a Membrane-Test "
@@ -706,6 +739,91 @@ def _selftest():
 
 
 # ----------------------------------------------------------------------------
+# Saved report
+# ----------------------------------------------------------------------------
+def _sweep_spec(sweeps: list[int]) -> str:
+    """'0-4' for a contiguous run, '0,2,5' otherwise."""
+    if not sweeps:
+        return "none"
+    if len(sweeps) > 1 and list(sweeps) == list(range(sweeps[0], sweeps[-1] + 1)):
+        return f"{sweeps[0]}-{sweeps[-1]}"
+    return ",".join(str(sw) for sw in sweeps)
+
+
+def transient_table(res: MembraneTestResult) -> str:
+    """Every detected transient, accepted or rejected with its reason. Shared by
+    the terminal output (--per-transient) and the saved report, so the numbers
+    on screen and the numbers on disk can never drift apart."""
+    lines = [f"{'edge':>7} {'dir':>3} {'Ra(M)':>8} {'Rm(M)':>9} "
+             f"{'Cm(pF)':>8} {'Cmq(pF)':>8} {'Tau(ms)':>8} {'Iss(pA)':>9} {'r2':>6}"]
+    for tr in res.transients:
+        d = "up" if tr.direction > 0 else "dn"
+        if tr.valid:
+            lines.append(f"{tr.edge_index:>7} {d:>3} {tr.Ra/1e6:8.2f} "
+                         f"{tr.Rm/1e6:9.1f} {tr.Cm*1e12:8.1f} "
+                         f"{tr.Cm_charge*1e12:8.1f} "
+                         f"{tr.tau*1e3:8.3f} {tr.Iss*1e12:9.1f} {tr.r2_fit:6.3f}")
+        else:
+            lines.append(f"{tr.edge_index:>7} {d:>3}  rejected: {tr.note}")
+    return "\n".join(lines)
+
+
+def report_text(res: MembraneTestResult, settings: Optional[dict] = None) -> str:
+    """The full measurement record: where the numbers came from, what settings
+    produced them, the summary, and the per-transient detail."""
+    src = res.source or {}
+    n_valid = sum(t.valid for t in res.transients)
+
+    def row(label, value):
+        return f"{label:<17}: {value}"
+
+    recorded = src.get("recorded")
+    rate = src.get("sample_rate_hz")
+    lines = ["Membrane test measurements", "=" * 26, ""]
+    lines.append(row("ABF file", src.get("path", "(arrays, not an ABF)")))
+    if src.get("protocol"):
+        lines.append(row("Protocol", src["protocol"]))
+    if recorded:
+        lines.append(row("Recorded", recorded.strftime("%Y-%m-%d %H:%M:%S")
+                         if hasattr(recorded, "strftime") else str(recorded)))
+    if rate and np.isfinite(rate):
+        lines.append(row("Sample rate", f"{rate:g} Hz"))
+    if src:
+        sweeps = src.get("sweeps", [])
+        lines.append(row("Sweeps analysed", f"{_sweep_spec(sweeps)} "
+                                           f"({len(sweeps)} of {src.get('sweep_count', len(sweeps))})"))
+        cmd = src.get("command_channel")
+        lines.append(row("Current channel", f"{src.get('channel')} "
+                                            f"({src.get('current_units', '?')})"))
+        lines.append(row("Command source", f"ADC channel {cmd}" if cmd is not None
+                         else "epoch table (sweepC)"))
+    lines.append(row("Analysed", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    if settings:
+        lines.append(row("Settings", ", ".join(f"{k}={v}" for k, v in settings.items())))
+    lines.append(row("Transients", f"{n_valid} valid of {len(res.transients)} detected"))
+
+    if src.get("acquisition_note"):
+        lines += ["", "NOTE: " + src["acquisition_note"]]
+
+    lines += ["", str(res), "", "Per transient", "-" * 13, transient_table(res), ""]
+    return "\n".join(lines)
+
+
+def default_report_path(abf_path: str) -> Path:
+    """``<recording>_membrane_test.txt``, beside the recording -- the rig's data
+    folder is where the .abf is, not wherever the shell happened to be."""
+    abf = Path(abf_path)
+    return abf.with_name(f"{abf.stem}_membrane_test.txt")
+
+
+def write_report(res: MembraneTestResult, out_path, settings: Optional[dict] = None) -> Path:
+    """Write the measurement report, overwriting any previous run's file."""
+    out = Path(out_path)
+    out.write_text(report_text(res, settings=settings), encoding="utf-8")
+    return out
+
+
+# ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
 def _parse_sweeps(spec: str) -> list[int]:
@@ -795,6 +913,11 @@ def main(argv=None):
     p.add_argument("--plot-average", action="store_true",
                    help="plot the across-sweep average trace instead of one sweep "
                         "(cleaner for checking the fit by eye)")
+    p.add_argument("--txt", nargs="?", const="", default=None, metavar="PATH",
+                   help="where to write the measurements text file (default: "
+                        "<recording>_membrane_test.txt next to the .abf)")
+    p.add_argument("--no-txt", action="store_true",
+                   help="don't save the measurements text file")
     p.add_argument("--per-transient", action="store_true",
                    help="Also print every accepted transient")
     p.add_argument("--selftest", action="store_true",
@@ -823,19 +946,26 @@ def main(argv=None):
         _make_plot(args, res)
 
     if args.per_transient:
-        print(f"{'edge':>7} {'dir':>3} {'Ra(M)':>8} {'Rm(M)':>9} "
-              f"{'Cm(pF)':>8} {'Cmq(pF)':>8} {'Tau(ms)':>8} {'r2':>6}")
-        for tr in res.transients:
-            d = "up" if tr.direction > 0 else "dn"
-            if tr.valid:
-                print(f"{tr.edge_index:>7} {d:>3} {tr.Ra/1e6:8.2f} "
-                      f"{tr.Rm/1e6:9.1f} {tr.Cm*1e12:8.1f} "
-                      f"{tr.Cm_charge*1e12:8.1f} "
-                      f"{tr.tau*1e3:8.3f} {tr.r2_fit:6.3f}")
-            else:
-                print(f"{tr.edge_index:>7} {d:>3}  {tr.note}")
+        print(transient_table(res))
         print()
     print(res)
+
+    # Saved by default: a membrane test measured at the rig and not written
+    # down is a measurement lost. --no-txt opts out, --txt PATH relocates.
+    if not args.no_txt:
+        settings = {
+            "method": args.method,
+            "t1": args.t1,
+            "fit": f"{args.fit[0]:g}-{args.fit[1]:g}% of peak",
+            "min_r2": args.min_r2,
+        }
+        out = Path(args.txt) if args.txt else default_report_path(args.abf)
+        try:
+            write_report(res, out, settings=settings)
+        except OSError as exc:
+            print(f"WARNING: could not write {out}: {exc}", file=sys.stderr)
+        else:
+            print(f"\nMeasurements written to {out}")
 
 
 if __name__ == "__main__":
