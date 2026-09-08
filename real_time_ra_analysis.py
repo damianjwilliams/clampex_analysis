@@ -298,6 +298,41 @@ def _solve_ra_exact(Rt: float, tau: float, Cm_charge: float):
     return Ra, bool(0.0 < Ra < Rt)
 
 
+def ra_by_both_methods(result) -> dict:
+    """Mean/SD of Ra over `result`'s transients, computed BOTH ways.
+
+    A transient stores only the Ra of whichever method was requested, but it
+    also stores the Rt, tau and Cm_charge that both solvers take, so the other
+    answer is recoverable here without re-reading the ABF or re-fitting tau.
+    Showing the pair side by side is the point: they disagree, and the
+    quadratic silently has no solution at all once Ra > Rt/4.
+
+    Transients rejected before any Ra solve (bad tau fit, non-physical Cm/Rt)
+    are excluded from both, so the two columns describe the same events. That
+    exclusion keys off the note text set at the single base-rejection site.
+
+    Returns {method: {"mean", "sd", "n"}} in Ohm; mean/sd are NaN when a method
+    solved nothing.
+    """
+    out = {}
+    for name, solver in (("exact", _solve_ra_exact),
+                         ("quadratic", _solve_ra_quadratic)):
+        vals = []
+        for tr in result.transients:
+            if tr.note.startswith("rejected"):
+                continue
+            if not all(np.isfinite(x) for x in (tr.Rt, tr.tau, tr.Cm_charge)):
+                continue
+            Ra, ok = solver(tr.Rt, tr.tau, tr.Cm_charge)
+            if ok and np.isfinite(Ra):
+                vals.append(Ra)
+        v = np.asarray(vals, float)
+        out[name] = {"mean": float(v.mean()) if v.size else float("nan"),
+                     "sd": float(v.std()) if v.size else float("nan"),
+                     "n": int(v.size)}
+    return out
+
+
 def membrane_test_from_arrays(
     time_s: np.ndarray,
     current_A: np.ndarray,
@@ -684,10 +719,45 @@ def _close_on_space(fig) -> None:
     fig.canvas.mpl_connect("key_press_event", on_key)
 
 
+def _grab_keyboard_focus(fig) -> None:
+    """Put the QC window in front with the keyboard pointed at its canvas.
+
+    Windows does not hand a newly opened window the keyboard while the process
+    that launched it still owns the foreground, which under watch_ra.py is the
+    console. The figure appears, but keystrokes keep going to the terminal, so
+    a key binding on the canvas looks dead even though it is connected. Raising
+    and activating the window fixes where the keys land.
+
+    Diagnostic if space still does nothing: try 'q', matplotlib's own built-in
+    quit key. If 'q' is dead too the window is not receiving the keyboard at
+    all (a focus problem, out here); if 'q' works and space does not, the
+    binding itself is at fault.
+    """
+    win = getattr(getattr(fig.canvas, "manager", None), "window", None)
+    if win is not None:
+        try:                                 # Qt
+            win.show()
+            win.raise_()
+            win.activateWindow()
+        except AttributeError:
+            try:                             # Tk
+                win.lift()
+                win.focus_force()
+            except Exception:                # noqa: BLE001 - best effort only
+                pass
+    try:                                     # Qt
+        fig.canvas.setFocus()
+    except AttributeError:
+        try:                                 # Tk
+            fig.canvas.get_tk_widget().focus_set()
+        except Exception:                    # noqa: BLE001 - best effort only
+            pass
+
+
 def plot_membrane_test(time_s, current_A, command_V, result,
                        out_path="membrane_test_qc.png", title="",
                        max_edges=2, fit_lo=0.10, fit_hi=0.80,
-                       cross_records=None, show=False):
+                       cross_records=None, show=False, method=None):
     """
     Draw a QC figure so every measurement can be checked by eye.
 
@@ -723,6 +793,28 @@ def plot_membrane_test(time_s, current_A, command_V, result,
     fig = plt.figure(figsize=(7.2 * n, 10.5))
     gs = fig.add_gridspec(4, n, height_ratios=[1.15, 0.42, 1.35, 1.15],
                           hspace=0.55, wspace=0.22)
+
+    # ---- header: Ra by BOTH methods, so the two are never confused ---------
+    # The reported numbers come from one method only; printing the other one
+    # beside it makes the size of the disagreement (and a quadratic that has
+    # no root at all) visible at a glance instead of needing a second run.
+    ra_both = ra_by_both_methods(result)
+
+    def _ra_str(key):
+        d = ra_both[key]
+        if not np.isfinite(d["mean"]):
+            return ("no real root (Ra > Rt/4)" if key == "quadratic"
+                    else "no valid transients")
+        return (f"{d['mean']/1e6:.1f} ± {d['sd']/1e6:.1f} "
+                f"MΩ (n={d['n']})")
+
+    def _tag(key):
+        return "  ← reported" if method == key else ""
+
+    fig.suptitle(
+        f"Ra  —  exact ($\\tau$/Cm_charge): {_ra_str('exact')}{_tag('exact')}"
+        f"        quadratic (MD note): {_ra_str('quadratic')}{_tag('quadratic')}",
+        y=0.997, va="top", fontsize=11, fontweight="bold")
 
     # ---- row 0: whole sweep, showing WHERE each measurement is taken --------
     axv = fig.add_subplot(gs[0, :])
@@ -884,7 +976,10 @@ def plot_membrane_test(time_s, current_A, command_V, result,
                   file=sys.stderr)
             return fallback
         _close_on_space(fig)
-        print("QC window open -- press the space bar (or close it) to continue.")
+        _grab_keyboard_focus(fig)
+        print("QC window open -- press the space bar (or close it) to continue. "
+              "If space does nothing, click the plot once to give it the "
+              "keyboard.")
         plt.show()
     else:
         plt.close(fig)
@@ -1014,7 +1109,8 @@ def _make_plot(args, res):
 
     out = plot_membrane_test(t, i, c, r, out_path=args.plot, title=title,
                              fit_lo=kw["fit_lo"], fit_hi=kw["fit_hi"],
-                             cross_records=cross, show=args.show)
+                             cross_records=cross, show=args.show,
+                             method=kw["method"])
     if out:
         print(f"QC figure written to {out}")
     if args.show:
