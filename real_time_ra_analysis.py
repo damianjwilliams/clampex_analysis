@@ -662,6 +662,28 @@ def membrane_test_from_abf(
 # ----------------------------------------------------------------------------
 # Diagnostic plot
 # ----------------------------------------------------------------------------
+def _close_on_space(fig) -> None:
+    """Bind the space bar to close `fig`.
+
+    On the rig this window is glanced at and dismissed once per recording, so
+    with the watcher running that is dozens of trips to the title-bar X in a
+    session. Space is unbound in matplotlib's default keymap, so this adds a
+    one-key dismissal without shadowing anything; matplotlib's own 'q' quit
+    binding keeps working too.
+    """
+    # Imported here, not at module scope, for the same reason plot_membrane_test
+    # defers it: pyplot must not be imported before that function has had its
+    # chance to call matplotlib.use("Agg"). By the time this runs there is a
+    # live figure, so the import is already cached.
+    import matplotlib.pyplot as plt
+
+    def on_key(event):
+        if event.key == " ":
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+
+
 def plot_membrane_test(time_s, current_A, command_V, result,
                        out_path="membrane_test_qc.png", title="",
                        max_edges=2, fit_lo=0.10, fit_hi=0.80,
@@ -670,8 +692,9 @@ def plot_membrane_test(time_s, current_A, command_V, result,
     Draw a QC figure so every measurement can be checked by eye.
 
     If `show` is True an interactive window is opened (blocking until you close
-    it); if `out_path` is given the figure is also written to disk. With
-    show=False and out_path set (the default) it saves headlessly via Agg.
+    it, or press the space bar); if `out_path` is given the figure is also
+    written to disk. With show=False and out_path set (the default) it saves
+    headlessly via Agg.
 
     Row 0  whole sweep, full scale: the I2 and I1 averaging windows are shaded
            where they actually sit (I1 is at the END of the step, far from the
@@ -860,6 +883,8 @@ def plot_membrane_test(time_s, current_A, command_V, result,
                   f"saved to {fallback} instead of showing a window.",
                   file=sys.stderr)
             return fallback
+        _close_on_space(fig)
+        print("QC window open -- press the space bar (or close it) to continue.")
         plt.show()
     else:
         plt.close(fig)
@@ -1024,7 +1049,7 @@ def main(argv=None):
                         "membrane_test_qc.png)")
     p.add_argument("--show", action="store_true",
                    help="open the QC figure in an interactive window instead of "
-                        "(or in addition to) saving it")
+                        "(or in addition to) saving it; the space bar closes it")
     p.add_argument("--plot-sweep", type=int, default=None,
                    help="which sweep to plot (default: first analysed sweep)")
     p.add_argument("--plot-average", action="store_true",
