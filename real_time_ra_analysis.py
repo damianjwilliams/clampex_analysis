@@ -333,6 +333,27 @@ def ra_by_both_methods(result) -> dict:
     return out
 
 
+def format_ra_both(ra_both: dict, method=None, tau_symbol="tau") -> str:
+    """One line naming both Ra results, marking `method` as the reported one.
+
+    Shared by the figure header and the console so the two cannot drift; the
+    figure passes a mathtext tau, the console the plain word.
+    """
+    def one(key, label):
+        d = ra_both[key]
+        if not np.isfinite(d["mean"]):
+            why = ("no real root (Ra > Rt/4)" if key == "quadratic"
+                   else "no valid transients")
+            body = why
+        else:
+            body = f"{d['mean']/1e6:.1f} ± {d['sd']/1e6:.1f} MΩ (n={d['n']})"
+        tag = "  ← reported" if method == key else ""
+        return f"{label}: {body}{tag}"
+
+    return (f"Ra  —  {one('exact', f'exact ({tau_symbol}/Cm_charge)')}"
+            f"        {one('quadratic', 'quadratic (MD note)')}")
+
+
 def membrane_test_from_arrays(
     time_s: np.ndarray,
     current_A: np.ndarray,
@@ -719,6 +740,36 @@ def _close_on_space(fig) -> None:
     fig.canvas.mpl_connect("key_press_event", on_key)
 
 
+def _fit_window_to_screen(fig, margin: float = 0.94) -> None:
+    """Shrink an oversized QC window so the whole figure is on screen.
+
+    The figure is 7.2in per transient by 10.5in tall -- around 1440x1050 px at
+    100 dpi, and half again as much under Windows display scaling. Qt opens a
+    window at that size regardless of whether it fits, so on a 1080p desktop
+    the top of the figure sits above the visible area and the Ra header there
+    is simply never seen. Resizing to the available screen geometry makes
+    matplotlib rescale the figure into the smaller canvas instead of cropping.
+
+    Best effort and Qt-only: the window object is duck-typed rather than
+    imported, so non-Qt backends fall through untouched.
+    """
+    win = getattr(getattr(fig.canvas, "manager", None), "window", None)
+    if win is None:
+        return
+    try:
+        avail = win.screen().availableGeometry()
+        w = min(win.width(), int(avail.width() * margin))
+        h = min(win.height(), int(avail.height() * margin))
+        if (w, h) != (win.width(), win.height()):
+            win.resize(w, h)
+            # A resized window keeps its old top-left, which for a window that
+            # started taller than the screen is off-screen; re-seat it.
+            win.move(avail.left() + (avail.width() - w) // 2,
+                     avail.top() + (avail.height() - h) // 2)
+    except Exception:                        # noqa: BLE001 - best effort only
+        pass
+
+
 def _grab_keyboard_focus(fig) -> None:
     """Put the QC window in front with the keyboard pointed at its canvas.
 
@@ -798,23 +849,9 @@ def plot_membrane_test(time_s, current_A, command_V, result,
     # The reported numbers come from one method only; printing the other one
     # beside it makes the size of the disagreement (and a quadratic that has
     # no root at all) visible at a glance instead of needing a second run.
-    ra_both = ra_by_both_methods(result)
-
-    def _ra_str(key):
-        d = ra_both[key]
-        if not np.isfinite(d["mean"]):
-            return ("no real root (Ra > Rt/4)" if key == "quadratic"
-                    else "no valid transients")
-        return (f"{d['mean']/1e6:.1f} ± {d['sd']/1e6:.1f} "
-                f"MΩ (n={d['n']})")
-
-    def _tag(key):
-        return "  ← reported" if method == key else ""
-
-    fig.suptitle(
-        f"Ra  —  exact ($\\tau$/Cm_charge): {_ra_str('exact')}{_tag('exact')}"
-        f"        quadratic (MD note): {_ra_str('quadratic')}{_tag('quadratic')}",
-        y=0.997, va="top", fontsize=11, fontweight="bold")
+    fig.suptitle(format_ra_both(ra_by_both_methods(result), method=method,
+                                tau_symbol="$\\tau$"),
+                 y=0.985, va="top", fontsize=11, fontweight="bold")
 
     # ---- row 0: whole sweep, showing WHERE each measurement is taken --------
     axv = fig.add_subplot(gs[0, :])
@@ -976,6 +1013,7 @@ def plot_membrane_test(time_s, current_A, command_V, result,
                   file=sys.stderr)
             return fallback
         _close_on_space(fig)
+        _fit_window_to_screen(fig)
         _grab_keyboard_focus(fig)
         print("QC window open -- press the space bar (or close it) to continue. "
               "If space does nothing, click the plot once to give it the "
@@ -1200,6 +1238,9 @@ def main(argv=None):
                 print(f"{tr.edge_index:>7} {d:>3}  {tr.note}")
         print()
     print(res)
+    # Also on the console: the QC window can be closed, off-screen or never
+    # opened, and this is the one place both Ra answers are guaranteed to land.
+    print(format_ra_both(ra_by_both_methods(res), method=args.method))
 
     if args.cross_check:
         import pyabf
