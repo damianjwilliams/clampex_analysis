@@ -22,9 +22,14 @@ Inside a cell folder each recording is identified from its .abf header --
 the Clampex protocol name and the recorded units -- and measured according
 to what it is:
 
-  * the FIRST voltage-clamp membrane test (protocol ``DW_Ra``) gives access
-    resistance, membrane resistance, capacitance and tau, via
-    ``calculate_Ra.py``;
+  * the voltage-clamp membrane tests (protocol ``DW_Ra``) that BRACKET those
+    recordings give access resistance, membrane resistance, capacitance and
+    tau, via ``calculate_Ra.py``, once before and once after. The rig runs an
+    Ra either side of each measurement, so a cell normally has two; when the
+    step recordings are run back to back the same pair brackets both of them.
+    A cell with only one Ra has it reported on whichever side it was actually
+    recorded, rather than being assumed to be the initial one, and
+    ``mt_Ra_change_pct`` says how far Ra moved across the recordings;
 
   * the current-clamp step file with the widest injected-current range
     (``DW_IC``, ``DW_IC_IV``, ``IC_IV``, ... -- matched by having a mV
@@ -99,7 +104,9 @@ same fields are available as flags (``--dob``, ``--sex``, ``--genotype``,
 
 When the run finishes, a QC window opens (``batch_qc_window.py``): the F-I
 curves of every cell overlaid, the cell-health measurements side by side
-against QC guides, and each cell's rheobase and max-firing traces.
+against QC guides -- Ra and Cm shown before and after the recordings, joined
+by a line, so a cell that ran down is obvious -- and each cell's rheobase and
+max-firing traces.
 ``--no-window`` skips it; ``--view`` reopens it later for a folder that has
 already been analysed, without re-running anything.
 
@@ -217,13 +224,14 @@ def read_header(path: Path) -> dict:
     job. Header-only read -- the sweep data is loaded later, and only for the
     files that turn out to matter.
     """
-    info = {"path": path, "protocol": "", "units": [], "when": None}
+    info = {"path": path, "protocol": "", "units": [], "when": None, "sweep_count": 0}
     try:
         import pyabf
         abf = pyabf.ABF(str(path), loadData=False)
         info["protocol"] = abf.protocol or ""
         info["units"] = [abf.adcUnits[c].strip() for c in abf.channelList]
         info["when"] = abf.abfDateTime
+        info["sweep_count"] = int(abf.sweepCount)
     except Exception as exc:
         info["error"] = str(exc)
     if info["when"] is None:
@@ -287,20 +295,68 @@ def load_cc_sweeps(path: Path, channel: Optional[int] = None) -> tuple[list[dict
 # ---------------------------------------------------------------------------
 # Role assignment
 # ---------------------------------------------------------------------------
-def pick_membrane_test(scanned: list[dict], protocol: str = "DW_Ra") -> Optional[Path]:
-    """The FIRST membrane test of the run.
+def membrane_test_candidates(scanned: list[dict], protocol: str = "DW_Ra",
+                             ) -> tuple[list[dict], list[str]]:
+    """Every recording in the folder that could be a membrane test, oldest first.
 
-    Two membrane tests usually bracket a run; the initial one is what the
-    cell's Ra/Cm should be judged on, since the final one reflects however
-    the recording ended. Matched on protocol name, falling back to any
-    voltage-clamp (pA) file if the name doesn't appear.
+    Matched on protocol name, falling back to voltage-clamp files if the name
+    never appears. Voltage clamp is judged on the PRIMARY channel's units, not
+    on the file having a pA channel anywhere: a current-clamp step file records
+    the current monitor alongside the membrane potential, so "has a pA channel"
+    is true of every recording the rig makes. The primary channel is the
+    amplifier's telegraphed output, so it is pA exactly when the cell was
+    voltage-clamped. Single-sweep files are excluded as well -- a gap-free
+    sEPSC recording is voltage clamp too, and has no test pulse to measure.
     """
     want = protocol.strip().lower()
     named = [c for c in scanned if want and want in (c["protocol"] or "").lower()]
     if named:
-        return named[0]["path"]
-    vc = [c for c in scanned if _has_units(c, ("pa", "na"))]
-    return vc[0]["path"] if vc else None
+        return named, []
+    vc = [c for c in scanned
+          if (c["units"] or [""])[0].strip().lower() in ("pa", "na", "a")
+          and int(c.get("sweep_count") or 0) > 1]
+    if vc:
+        return vc, [f"no {protocol} recording; used the voltage-clamp file(s) "
+                    f"{', '.join(c['path'].name for c in vc)} as membrane tests"]
+    return [], []
+
+
+def pick_membrane_tests(scanned: list[dict], targets: list[Optional[Path]],
+                        protocol: str = "DW_Ra",
+                        ) -> tuple[Optional[Path], Optional[Path], list[str]]:
+    """(before, after, notes): the membrane tests bracketing `targets`.
+
+    The rig runs an Ra either side of each measurement, so which one is the
+    "before" is a fact about WHEN the step recordings were made, not about
+    which Ra file happens to come first in the folder -- a cell whose only Ra
+    was recorded after the F-I curve would otherwise have a run-down Ra
+    reported as its initial one, which is the opposite of the truth.
+
+    `targets` are the recordings being bracketed (the step file, and the
+    hyperpolarizing file when that is a separate recording). Run back to back,
+    as they usually are, they share one pair: the Ra before the first and the
+    Ra after the last. Either side may be missing, and is then simply None.
+    """
+    cands, notes = membrane_test_candidates(scanned, protocol)
+    if not cands:
+        return None, None, notes
+
+    times = [c["when"] for c in scanned
+             if c["path"] in {t for t in targets if t is not None} and c["when"]]
+    if not times:
+        # Nothing datable to bracket (a header with no timestamp, or no step
+        # recording at all): fall back to the folder's first and last.
+        first, last = cands[0]["path"], cands[-1]["path"]
+        return first, (last if last != first else None), notes
+
+    t0, t1 = min(times), max(times)
+    before = [c for c in cands if c["when"] and c["when"] <= t0]
+    after = [c for c in cands if c["when"] and c["when"] >= t1]
+    pre = before[-1]["path"] if before else None            # the nearest one before
+    post = after[0]["path"] if after else None              # the nearest one after
+    if post is not None and post == pre:
+        post = None
+    return pre, post, notes
 
 
 def pick_step_files(scanned: list[dict], protocol: str = "",
@@ -643,6 +699,15 @@ def analyze_membrane_test(path: Path, opts) -> tuple[dict, list[str]]:
     return row, written
 
 
+def analyze_membrane_test_post(path: Path, opts) -> tuple[dict, list[str]]:
+    """The closing membrane test, under ``mt_post_*`` keys.
+
+    Measured exactly like the opening one -- the pair is only comparable if
+    nothing differs but the recording."""
+    row, written = analyze_membrane_test(path, opts)
+    return {f"mt_post_{k[len('mt_'):]}": v for k, v in row.items()}, written
+
+
 def analyze_subthreshold(path: Path, opts) -> tuple[dict, list[str]]:
     """Sag and sag-free input resistance from the hyperpolarizing sweeps."""
     sweeps, _meta = load_cc_sweeps(path)
@@ -729,6 +794,29 @@ def analyze_action_potentials(path: Path, opts) -> tuple[dict, list[str]]:
     return summary, written
 
 
+def _as_float(value) -> float:
+    """A summary value as a float, NaN when absent or non-numeric."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def ra_drift(row: dict) -> dict:
+    """How far access resistance moved between the two membrane tests.
+
+    As a percentage of where it started, which is what a run-down judgement is
+    actually made on: +8 MOhm means something different on a 12 MOhm seal than
+    on a 30 MOhm one. Empty unless the cell has both an opening and a closing
+    membrane test.
+    """
+    pre, post = _as_float(row.get("mt_Ra_MOhm")), _as_float(row.get("mt_post_Ra_MOhm"))
+    if not (np.isfinite(pre) and np.isfinite(post)) or pre == 0:
+        return {}
+    return {"mt_Ra_change_MOhm": post - pre,
+            "mt_Ra_change_pct": 100.0 * (post - pre) / pre}
+
+
 # ---------------------------------------------------------------------------
 # Per-cell driver
 # ---------------------------------------------------------------------------
@@ -760,20 +848,27 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
         if info.get("error"):
             notes.append(f"unreadable: {info['path'].name} ({info['error']})")
 
-    ra_path = pick_membrane_test(scanned, opts.protocol_ra)
+    # The step files are chosen first because the membrane tests are located
+    # relative to them: "before" and "after" are times, not file positions.
     steps_path, hyper_path, pick_notes = pick_step_files(
         scanned, opts.protocol_steps, opts.protocol_hyperpol)
     notes += pick_notes
+    ra_pre, ra_post, ra_notes = pick_membrane_tests(
+        scanned, [steps_path, hyper_path], opts.protocol_ra)
+    notes += ra_notes
 
-    row["file_membrane_test"] = ra_path.name if ra_path else ""
+    row["file_membrane_test"] = ra_pre.name if ra_pre else ""
+    row["file_membrane_test_post"] = ra_post.name if ra_post else ""
     row["file_steps"] = steps_path.name if steps_path else ""
     row["file_hyperpol"] = hyper_path.name if hyper_path else ""
-    used = {p for p in (ra_path, steps_path, hyper_path) if p is not None}
+    used = {p for p in (ra_pre, ra_post, steps_path, hyper_path) if p is not None}
     row["files_unused"] = ";".join(c["path"].name for c in scanned if c["path"] not in used)
 
     stages = [
-        ("membrane test", ra_path, analyze_membrane_test,
-         f"no {opts.protocol_ra} (or any voltage-clamp) recording"),
+        ("Ra before", ra_pre, analyze_membrane_test,
+         f"no {opts.protocol_ra} (or any voltage-clamp) recording before the steps"),
+        ("Ra after", ra_post, analyze_membrane_test_post,
+         f"no {opts.protocol_ra} recording after the steps"),
         ("sag / Rin", hyper_path, analyze_subthreshold,
          "no hyperpolarizing sweeps in this folder"),
         ("AP analysis", steps_path, analyze_action_potentials,
@@ -782,18 +877,19 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
     for label, path, fn, missing in stages:
         if path is None:
             notes.append(f"{label} skipped: {missing}")
-            print(f"    {label:<14} -- skipped ({missing})")
+            print(f"    {label:<15} -- skipped ({missing})")
             continue
         try:
             out, written = fn(path, opts)
             row.update(out)
-            print(f"    {label:<14} {path.name}  ->  {len(written)} file(s)")
+            print(f"    {label:<15} {path.name}  ->  {len(written)} file(s)")
         except (Exception, SystemExit) as exc:
             notes.append(f"{label} failed on {path.name}: {exc}")
-            print(f"    {label:<14} {path.name}  ->  FAILED: {exc}", file=sys.stderr)
+            print(f"    {label:<15} {path.name}  ->  FAILED: {exc}", file=sys.stderr)
             if opts.traceback:
                 traceback.print_exc()
 
+    row.update(ra_drift(row))
     row["notes"] = " | ".join(notes)
     return row
 
@@ -805,10 +901,14 @@ COLUMN_ORDER = [
     "folder_name", "date", "slice", "cell", "rmp_folder_mV", "label",
     # animal (one set of values per run; age is per recording date)
     "genotype", "strain", "animal_sex", "animal_dob", "age_days",
-    "file_membrane_test", "file_steps", "file_hyperpol",
-    # membrane test (voltage clamp)
+    "file_membrane_test", "file_membrane_test_post", "file_steps", "file_hyperpol",
+    # membrane test (voltage clamp), before the step recordings ...
     "mt_Ra_MOhm", "mt_Ra_sd", "mt_Rm_MOhm", "mt_Rt_MOhm", "mt_Cm_pF", "mt_Cm_sd",
     "mt_tau_ms", "mt_Iss_pA", "mt_n_transients",
+    # ... and after them, plus how far Ra moved in between
+    "mt_post_Ra_MOhm", "mt_post_Ra_sd", "mt_post_Rm_MOhm", "mt_post_Rt_MOhm",
+    "mt_post_Cm_pF", "mt_post_Cm_sd", "mt_post_tau_ms", "mt_post_Iss_pA",
+    "mt_post_n_transients", "mt_Ra_change_MOhm", "mt_Ra_change_pct",
     # subthreshold current clamp
     "Vrest_measured_mV", "bias_current_pA", "bias_current_sd_pA", "sag_target_mV", "sag_ratio", "sag_amplitude_mV",
     "sag_v_peak_mV", "sag_stim_pA", "sag_bracketed", "sag_n_sweeps", "sag_note",
@@ -1080,6 +1180,11 @@ def main(argv=None) -> int:
 
     failed = int(df["notes"].astype(str).str.contains("failed").sum())
     print(f"\nSummary ({len(df)} cells, {failed} with a failed stage)  ->  {out}")
+
+    # The table in memory, not the CSV just written: identical content, but it
+    # means a run whose summary landed somewhere else via --out still opens.
+    if not args.no_window:
+        show_qc_window(root, df)
     return 0
 
 

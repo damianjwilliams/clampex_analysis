@@ -2,6 +2,11 @@
 good: the F-I curves of every cell overlaid, the cell-health measurements side
 by side against QC guides, and the raw traces behind them.
 
+Access resistance and capacitance are shown twice per cell -- from the
+membrane test before the step recordings and the one after -- joined by a
+line, so a cell that ran down during the recording reads as a slope rather
+than as a single number that happens to look acceptable.
+
 Opened automatically at the end of a ``batch_cell_analysis.py`` run, and
 available on its own for a folder that has already been analysed:
 
@@ -33,15 +38,22 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtWidgets
 
-# (column, label, unit, threshold, which side is bad)
+# (column before, column after, label, unit, threshold, which side is bad)
+# The "after" column is None for everything measured from the step recording
+# itself, which happens once and so has no before/after to show.
 QC_GUIDES = [
-    ("mt_Ra_MOhm",      "Access resistance",  "MOhm", 25.0,  "above"),
-    ("mt_Cm_pF",        "Capacitance",        "pF",   None,  None),
-    ("resting_Vm_mV",   "Resting Vm",         "mV",   -55.0, "above"),
-    ("rheobase_pA",     "Rheobase",           "pA",   None,  None),
-    ("AP_amplitude_mV", "AP amplitude",       "mV",   40.0,  "below"),
-    ("AP_halfwidth_ms", "AP half-width",      "ms",   None,  None),
+    ("mt_Ra_MOhm",      "mt_post_Ra_MOhm", "Access resistance",  "MOhm", 25.0,  "above"),
+    ("mt_Cm_pF",        "mt_post_Cm_pF",   "Capacitance",        "pF",   None,  None),
+    ("resting_Vm_mV",   None,              "Resting Vm",         "mV",   -55.0, "above"),
+    ("rheobase_pA",     None,              "Rheobase",           "pA",   None,  None),
+    ("AP_amplitude_mV", None,              "AP amplitude",       "mV",   40.0,  "below"),
+    ("AP_halfwidth_ms", None,              "AP half-width",      "ms",   None,  None),
 ]
+
+# Ra moving by more than this across the recordings flags the cell, however
+# healthy both ends look on their own: it is the change, not the value, that
+# says the access was unstable while the F-I curve was being measured.
+RA_DRIFT_PCT = 20.0
 
 _app_ref = None      # keeps the QApplication alive when this module made it
 
@@ -128,19 +140,33 @@ def _num(row, key) -> float:
 
 
 def _flagged(summary: pd.DataFrame) -> dict[str, list[str]]:
-    """Which cells trip a QC guide, and on what."""
+    """Which cells trip a QC guide, and on what.
+
+    A paired measurement is checked at both ends -- a cell whose Ra started
+    fine and ended at 40 MOhm is flagged on the closing value."""
     out: dict[str, list[str]] = {}
-    for col, label, unit, thresh, side in QC_GUIDES:
-        if thresh is None or col not in summary:
+
+    def flag(row, reason):
+        out.setdefault(str(row.get("folder_name", "")), []).append(reason)
+
+    for col, post_col, label, unit, thresh, side in QC_GUIDES:
+        if thresh is None:
             continue
-        for _i, row in summary.iterrows():
-            v = _num(row, col)
-            if not np.isfinite(v):
+        for when, c in (("", col), (" after", post_col)):
+            if not c or c not in summary:
                 continue
-            bad = v > thresh if side == "above" else v < thresh
-            if bad:
-                out.setdefault(str(row.get("folder_name", "")), []).append(
-                    f"{label} {v:.1f} {unit}")
+            for _i, row in summary.iterrows():
+                v = _num(row, c)
+                if not np.isfinite(v):
+                    continue
+                if v > thresh if side == "above" else v < thresh:
+                    flag(row, f"{label}{when} {v:.1f} {unit}")
+
+    if "mt_Ra_change_pct" in summary:
+        for _i, row in summary.iterrows():
+            d = _num(row, "mt_Ra_change_pct")
+            if np.isfinite(d) and abs(d) > RA_DRIFT_PCT:
+                flag(row, f"Ra drifted {d:+.0f}%")
     return out
 
 
@@ -265,22 +291,49 @@ class QCWindow(QtWidgets.QMainWindow):
         return fig
 
     # -- tab 2: cell health --------------------------------------------
+    def _column(self, col: Optional[str]) -> pd.Series:
+        """One summary column as floats, all-NaN when the run never wrote it."""
+        if not col or col not in self.summary:
+            return pd.Series([np.nan] * len(self.names), dtype=float)
+        return pd.to_numeric(self.summary[col], errors="coerce")
+
     def _health_figure(self) -> Figure:
         fig = Figure(figsize=(12, 7.2), tight_layout=True)
         x = np.arange(len(self.names))
-        for k, (col, label, unit, thresh, side) in enumerate(QC_GUIDES):
+        # How far the before/after markers of one cell sit either side of its
+        # tick. Wide enough to read as a pair, narrow enough not to be mistaken
+        # for the neighbouring cell.
+        dx = 0.16
+        for k, (col, post_col, label, unit, thresh, side) in enumerate(QC_GUIDES):
             ax = fig.add_subplot(2, 3, k + 1)
-            vals = (pd.to_numeric(self.summary.get(col), errors="coerce")
-                    if col in self.summary else pd.Series([np.nan] * len(x)))
+            pre_vals, post_vals = self._column(col), self._column(post_col)
+            paired = bool(post_col) and bool(np.isfinite(post_vals.to_numpy(float)).any())
+
+            def trips(v):
+                return thresh is not None and (v > thresh if side == "above" else v < thresh)
+
             for i, name in enumerate(self.names):
-                v = vals.iloc[i] if i < len(vals) else np.nan
-                if not np.isfinite(v):
-                    continue
-                bad = thresh is not None and (v > thresh if side == "above" else v < thresh)
-                ax.plot([i], [v], "o", ms=11, color="#d62728" if bad else self.colors[name],
-                        markeredgecolor="black" if bad else "none", zorder=3)
-                ax.annotate(f"{v:.1f}", (i, v), textcoords="offset points",
-                            xytext=(0, 11), ha="center", fontsize=7.5)
+                a = pre_vals.iloc[i] if i < len(pre_vals) else np.nan
+                b = post_vals.iloc[i] if paired and i < len(post_vals) else np.nan
+                if np.isfinite(a) and np.isfinite(b):
+                    # The line IS the measurement here: its slope is the
+                    # run-down over the course of the recording.
+                    ax.plot([i - dx, i + dx], [a, b], "-", lw=1.2, alpha=0.65,
+                            color=self.colors[name], zorder=2)
+                # Circle before, square after; the text leans away from its own
+                # marker so the two numbers of a pair can never collide.
+                marks = (((a, -dx, "o", -3, "right"), (b, dx, "s", 3, "left"))
+                         if paired else ((a, 0.0, "o", 0, "center"),))
+                for v, off, marker, tx, ha in marks:
+                    if not np.isfinite(v):
+                        continue
+                    bad = trips(v)
+                    ax.plot([i + off], [v], marker, ms=10,
+                            color="#d62728" if bad else self.colors[name],
+                            markeredgecolor="black" if bad else "none", zorder=3)
+                    ax.annotate(f"{v:.1f}", (i + off, v), textcoords="offset points",
+                                xytext=(tx, 10), ha=ha, fontsize=7.5)
+
             if thresh is not None:
                 ax.axhline(thresh, color="#d62728", ls="--", lw=1.0, alpha=0.8,
                            label=f"QC guide {thresh:g} {unit}")
@@ -290,7 +343,16 @@ class QCWindow(QtWidgets.QMainWindow):
             # run it is the same on every cell and just eats axis width.
             ax.set_xticklabels([re.sub(r"^\d{6}_", "", n) for n in self.names],
                                rotation=30, ha="right", fontsize=7.5)
-            ax.set_title(f"{label} ({unit})", fontsize=10)
+            title = f"{label} ({unit})"
+            if paired:
+                title += "\nbefore (circle) to after (square)"
+            ax.set_title(title, fontsize=10)
+            if len(x):
+                # Paired panels need more room at the edges: the outermost
+                # value labels lean outward, and at the default limits the
+                # leftmost one is drawn over the y-axis tick labels.
+                pad = 0.9 if paired else 0.6
+                ax.set_xlim(-pad, len(x) - 1 + pad)
             ax.margins(y=0.25)
             ax.grid(axis="y", alpha=0.25)
         fig.suptitle("Cell health across the batch   (red = trips a QC guide; "
