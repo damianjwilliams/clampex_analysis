@@ -46,6 +46,8 @@ Requires Python 3.11+ on Windows.
 |---|---|
 | [`sepsc/`](sepsc/README.md) | sEPSC detection, curation, and fast/slow classification pipeline — see its own README for full usage |
 | `autorun_AP_analysis.py` | Action-potential feature extraction from current-clamp recordings, via the Allen Institute's [ipfx](https://github.com/AllenInstitute/ipfx) |
+| `batch_cell_analysis.py` | Batch driver: one folder per cell (`YYMMDD_s<slice>_c<cell>_<RMP>`), one summary row per cell — membrane test, sag / input resistance, and AP features |
+| `batch_run_dialog.py` | PyQt5 dialog the batch driver opens when given no folder: picks the experiment folder and records the animal (DOB, sex, genotype, strain) |
 | `calculate_Ra.py` | Access resistance / membrane resistance / capacitance / tau from a voltage-clamp "Membrane Test" recording |
 | `check_sta_data.py` | Quick averaging utility for `.sta` spike-triggered-average files |
 | `membrane_test.ipynb`, `membrane_test_whole_trace.ipynb` | Notebook versions of the membrane-test calculation, for interactive exploration |
@@ -59,5 +61,26 @@ accepts a path directly:
 python autorun_AP_analysis.py recording.abf
 python calculate_Ra.py recording.abf
 ```
+
+To analyse a whole experiment at once, put each cell's recordings in a subfolder
+named `YYMMDD_s<slice>_c<cell>_<RMP>` (e.g. `260817_s1_c1_-67`; bare numbers and
+a trailing label also parse) and point the batch driver at the folder above them:
+```
+python batch_cell_analysis.py DATA_ROOT
+python batch_cell_analysis.py               # dialog: pick the folder + the animal
+python batch_cell_analysis.py --selftest    # validate the sag/Rin maths
+```
+Run with no folder and a dialog asks for the experiment folder together with the
+animal it came from — date of birth, sex, genotype, strain — and reports how many
+cell folders it found before anything runs. Those go into every summary row, and
+the DOB gives each cell an `age_days` from its folder's recording date. The same
+fields are flags (`--dob`, `--sex`, `--genotype`, `--strain`) for scripted runs.
+It picks each cell's recordings out of the folder from their .abf headers — the
+first `DW_Ra` membrane test for Ra/Rm/Cm/tau, and the current-clamp step file
+with the widest injected-current range for the AP features. Hyperpolarizing
+sweeps, from that file or from a separate hyperpolarizing protocol, also give
+sag at a fixed membrane potential (-85 mV by default) and an input resistance
+fitted only over the steps too small to activate Ih. Per-cell outputs land next
+to the recordings; `batch_cell_summary.csv` at the root has one row per cell.
 See each script's module docstring for full details, and [`sepsc/README.md`](sepsc/README.md)
 for the sEPSC pipeline's commands and output-file conventions.
