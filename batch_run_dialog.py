@@ -1,12 +1,20 @@
 """PyQt5 dialog that starts a batch run: pick the experiment folder and record
-the animal it came from -- date of birth, sex, genotype, strain.
+the animal it came from -- which mouse it was, and its date of birth, sex,
+genotype and strain.
+
+Which mouse is three fields rather than one, because no single one of them is
+reliable on its own: the mouse number is only unique within a cage, the cage
+number changes when animals are moved or a litter is weaned, and the ID
+markers (ear punch, tail marks, tag) are what is actually readable on the
+animal at the rig. Recording all three means a cell can still be traced back
+to an animal when one of them turns out to be wrong or missing.
 
 The animal details are applied to every cell analysed in the run, so they end
 up as columns in ``batch_cell_summary.csv`` alongside each cell's own
 measurements, and the date of birth also gives each cell an age in days
 (folder date minus DOB).
 
-Choices are remembered between runs via QSettings -- genotype and strain keep
+Choices are remembered between runs via QSettings -- the free-text fields keep
 a history, so the second experiment on a line is a dropdown pick rather than
 retyping. Nothing is remembered about the recordings themselves; the folder is
 re-scanned every time it is chosen, and the dialog says how many cell folders
@@ -111,10 +119,24 @@ class RunDialog(QtWidgets.QDialog):
         self.sex_combo.addItems(SEXES)
         self.sex_combo.setCurrentText(self.settings.value("sex", "unknown", type=str))
 
+        self.mouse_combo = self._history_combo("mouse_number", "e.g. 3, M3")
+        self.cage_combo = self._history_combo("cage_number", "e.g. 1234567")
+        self.markers_combo = self._history_combo(
+            "id_markers", "e.g. ear punch R, tail 2 stripes, tag 417")
+        self.mouse_combo.setToolTip("The animal's number. Usually only unique "
+                                    "within its cage, so record the cage too.")
+        self.cage_combo.setToolTip("The cage the animal was housed in at the "
+                                   "time of the recording.")
+        self.markers_combo.setToolTip("Whatever physically identifies this animal: "
+                                      "ear punch, tail marks, ear tag.")
+
         self.genotype_combo = self._history_combo("genotype", "e.g. Sst-Cre;Ai14, WT")
         self.strain_combo = self._history_combo("strain", "e.g. C57BL/6J")
 
         form = QtWidgets.QFormLayout()
+        form.addRow("Mouse number", self.mouse_combo)
+        form.addRow("Cage number", self.cage_combo)
+        form.addRow("ID markers", self.markers_combo)
         form.addRow("Date of birth", dob_row)
         form.addRow("Sex", self.sex_combo)
         form.addRow("Genotype", self.genotype_combo)
@@ -226,6 +248,9 @@ class RunDialog(QtWidgets.QDialog):
     def values(self) -> dict:
         return {
             "root": self.root,
+            "mouse_number": self.mouse_combo.currentText().strip(),
+            "cage_number": self.cage_combo.currentText().strip(),
+            "id_markers": self.markers_combo.currentText().strip(),
             "animal_dob": self.dob(),
             "animal_sex": self.sex_combo.currentText().strip(),
             "genotype": self.genotype_combo.currentText().strip(),
@@ -242,7 +267,7 @@ class RunDialog(QtWidgets.QDialog):
         self.settings.setValue("dob", self.dob_edit.date().toString("yyyy-MM-dd"))
         self.settings.setValue("dob_unknown", self.dob_unknown.isChecked())
         self.settings.setValue("sex", v["animal_sex"])
-        for key in ("genotype", "strain"):
+        for key in ("mouse_number", "cage_number", "id_markers", "genotype", "strain"):
             self.settings.setValue(key + "_last", v[key])
             _remember(self.settings, key, v[key])
         super().accept()

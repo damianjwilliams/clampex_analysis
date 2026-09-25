@@ -94,13 +94,22 @@ and one row per cell at the root:
 Animal details
 --------------
 Run with no folder argument and a dialog collects both the experiment folder
-and the animal it came from -- date of birth, sex, genotype, strain -- and
-says how many cell folders it found before anything is analysed. Those
-details are written to every row of the summary, and the date of birth gives
-each cell an ``age_days`` (its folder's date minus the DOB), so cells from
-different litters stay distinguishable once the summaries are pooled. The
-same fields are available as flags (``--dob``, ``--sex``, ``--genotype``,
-``--strain``) for scripted runs, and ``--no-gui`` skips the dialog.
+and the animal it came from -- which mouse it was (number, cage, ID markers)
+and its date of birth, sex, genotype and strain -- and says how many cell
+folders it found before anything is analysed. Those details are written to
+every row of the summary, and the date of birth gives each cell an
+``age_days`` (its folder's date minus the DOB), so cells from different
+litters stay distinguishable once the summaries are pooled.
+
+The animal is identified by three fields rather than one because no single
+one of them is reliable on its own: a mouse number is only unique within its
+cage, a cage number changes when animals are moved, and the ID markers (ear
+punch, tail marks, tag) are what is readable on the animal at the rig. All
+three are recorded so a cell can still be traced back when one is wrong.
+
+The same fields are available as flags (``--mouse``, ``--cage``,
+``--id-markers``, ``--dob``, ``--sex``, ``--genotype``, ``--strain``) for
+scripted runs, and ``--no-gui`` skips the dialog.
 
 When the run finishes, a QC window opens (``batch_qc_window.py``): the F-I
 curves of every cell overlaid, the cell-health measurements side by side
@@ -114,7 +123,8 @@ Usage
 -----
     python batch_cell_analysis.py                     # dialog: folder + animal
     python batch_cell_analysis.py DATA_ROOT
-    python batch_cell_analysis.py DATA_ROOT --dob 2026-06-01 --sex male \
+    python batch_cell_analysis.py DATA_ROOT --mouse 3 --cage 1234567 \
+        --id-markers "ear punch R" --dob 2026-06-01 --sex male \
         --genotype "Sst-Cre;Ai14" --strain C57BL/6J
     python batch_cell_analysis.py DATA_ROOT --no-plot
     python batch_cell_analysis.py DATA_ROOT --sag-target -85 --rin-v-floor -78
@@ -900,6 +910,7 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
 COLUMN_ORDER = [
     "folder_name", "date", "slice", "cell", "rmp_folder_mV", "label",
     # animal (one set of values per run; age is per recording date)
+    "mouse_number", "cage_number", "id_markers",
     "genotype", "strain", "animal_sex", "animal_dob", "age_days",
     "file_membrane_test", "file_membrane_test_post", "file_steps", "file_hyperpol",
     # membrane test (voltage clamp), before the step recordings ...
@@ -1103,6 +1114,12 @@ def main(argv=None) -> int:
                    help="dV/dt spike-detection threshold in mV/ms (default 20)")
     p.add_argument("--min-peak", type=float, default=-30.0,
                    help="minimum AP peak voltage in mV (default -30)")
+    p.add_argument("--mouse", default="", metavar="N",
+                   help="the animal's number; usually unique only within its cage")
+    p.add_argument("--cage", default="", metavar="N",
+                   help="the cage the animal was housed in when it was recorded")
+    p.add_argument("--id-markers", default="", metavar="TEXT",
+                   help="what physically identifies the animal, e.g. 'ear punch R'")
     p.add_argument("--dob", default="", metavar="YYYY-MM-DD",
                    help="animal's date of birth; gives each cell an age in days")
     p.add_argument("--sex", default="", help="animal's sex (male / female / unknown)")
@@ -1129,7 +1146,9 @@ def main(argv=None) -> int:
 
     if args.dob and age_days(args.dob, "000101") is None:
         p.error(f"--dob must be a calendar date as YYYY-MM-DD, not {args.dob!r}")
-    args.animal = {"genotype": args.genotype.strip(), "strain": args.strain.strip(),
+    args.animal = {"mouse_number": args.mouse.strip(), "cage_number": args.cage.strip(),
+                   "id_markers": args.id_markers.strip(),
+                   "genotype": args.genotype.strip(), "strain": args.strain.strip(),
                    "animal_sex": args.sex.strip(), "animal_dob": args.dob.strip()}
 
     # With no folder argument, the dialog collects the folder AND the animal
