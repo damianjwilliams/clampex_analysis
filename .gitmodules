@@ -1,0 +1,3 @@
+[submodule "sEPSC_multimethod"]
+	path = sEPSC_multimethod
+	url = https://github.com/damianjwilliams/sEPSC_multimethod.git

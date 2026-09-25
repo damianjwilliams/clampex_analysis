@@ -39,7 +39,13 @@ to what it is:
 
   * its hyperpolarizing sweeps -- or a dedicated hyperpolarizing-step file
     if the folder has one -- give sag at a fixed membrane potential and
-    input resistance measured where Ih cannot distort it (below).
+    input resistance measured where Ih cannot distort it (below);
+
+  * the gap-free voltage-clamp recording gives spontaneous EPSCs, detected by
+    deconvolution via ``batch_sepsc.py``: rate, amplitude, kinetics, and the
+    noise floor and holding-current drift that say whether those numbers mean
+    anything. ``--no-sepsc`` skips it, which is worth knowing because it is
+    much the slowest stage.
 
 Any of these may be missing. Whatever is present is analysed, and the
 summary row says what was found, what was not, and what failed.
@@ -86,6 +92,8 @@ single-file tools use:
     <steps>_AP_spikes.csv          one row per detected AP
     <steps>_AP_sweeps.csv          one row per sweep
     <steps>_AP_qc.png, <steps>_AP_rheobase.png
+    <sepsc>_sEPSC_events.csv       one row per detected sEPSC
+    <sepsc>_sEPSC_waveforms.npz    aligned event waveforms, for the QC window
 
 and one row per cell at the root:
 
@@ -139,7 +147,9 @@ Usage
     python batch_cell_analysis.py DATA_ROOT --view    # just show the QC window
     python batch_cell_analysis.py --selftest          # synthetic validation
 
-Requires: numpy, pandas, matplotlib, pyabf, ipfx, scipy.
+Requires: numpy, pandas, matplotlib, pyabf, ipfx, scipy. The sEPSC stage also
+needs the ``sEPSC_multimethod`` submodule (``git submodule update --init``);
+without it every other stage still runs.
 """
 
 from __future__ import annotations
@@ -156,6 +166,7 @@ import numpy as np
 import pandas as pd
 
 import autorun_AP_analysis as ap
+import batch_sepsc
 import calculate_Ra as mt
 # The per-sweep stimulus window comes from the ABF epoch table; reuse the AP
 # script's detector rather than re-deriving it, so the subthreshold and
@@ -375,6 +386,38 @@ def pick_membrane_tests(scanned: list[dict], targets: list[Optional[Path]],
     if post is not None and post == pre:
         post = None
     return pre, post, notes
+
+
+def pick_sepsc_file(scanned: list[dict], protocol: str = "gap_free",
+                    ) -> tuple[Optional[Path], list[str]]:
+    """(the sEPSC recording, notes).
+
+    A gap-free recording is the sEPSC one: a single long sweep in voltage
+    clamp with no command steps. Matched on protocol name, falling back to any
+    single-sweep voltage-clamp file -- which is what a gap-free recording is,
+    whatever the protocol happened to be called. Judged on the PRIMARY
+    channel's units for the same reason the membrane tests are: every
+    recording the rig makes has a pA channel somewhere.
+
+    The FIRST is analysed when a cell has several. Two gap-free recordings are
+    usually a baseline and then a drug condition, and the baseline is the one
+    comparable across cells; the rest are named in the notes so that a
+    recording is never dropped silently.
+    """
+    notes: list[str] = []
+    gapfree = [c for c in scanned
+               if (c["units"] or [""])[0].strip().lower() in ("pa", "na", "a")
+               and int(c.get("sweep_count") or 0) == 1]
+    want = protocol.strip().lower()
+    named = [c for c in gapfree if want and want in (c["protocol"] or "").lower()]
+    cands = named or gapfree
+    if not cands:
+        return None, notes
+    if len(cands) > 1:
+        notes.append(f"{len(cands)} gap-free recordings; analysed the first "
+                     f"({cands[0]['path'].name}), did not analyse "
+                     f"{', '.join(c['path'].name for c in cands[1:])}")
+    return cands[0]["path"], notes
 
 
 def pick_step_files(scanned: list[dict], protocol: str = "",
@@ -874,12 +917,17 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
     ra_pre, ra_post, ra_notes = pick_membrane_tests(
         scanned, [steps_path, hyper_path], opts.protocol_ra)
     notes += ra_notes
+    sepsc_path, sepsc_notes = pick_sepsc_file(
+        scanned, getattr(opts, "protocol_sepsc", "gap_free"))
+    notes += sepsc_notes
 
     row["file_membrane_test"] = ra_pre.name if ra_pre else ""
     row["file_membrane_test_post"] = ra_post.name if ra_post else ""
     row["file_steps"] = steps_path.name if steps_path else ""
     row["file_hyperpol"] = hyper_path.name if hyper_path else ""
-    used = {p for p in (ra_pre, ra_post, steps_path, hyper_path) if p is not None}
+    row["file_sepsc"] = sepsc_path.name if sepsc_path else ""
+    used = {p for p in (ra_pre, ra_post, steps_path, hyper_path, sepsc_path)
+            if p is not None}
     row["files_unused"] = ";".join(c["path"].name for c in scanned if c["path"] not in used)
 
     stages = [
@@ -892,6 +940,11 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
         ("AP analysis", steps_path, analyze_action_potentials,
          "no current-clamp step recording"),
     ]
+    # Last because it is the slowest stage by far: a ten-minute gap-free
+    # recording is more samples than everything above it put together.
+    if not getattr(opts, "no_sepsc", False):
+        stages.append(("sEPSC", sepsc_path, batch_sepsc.analyze_sepsc,
+                       "no gap-free (sEPSC) recording"))
     for label, path, fn, missing in stages:
         if path is None:
             notes.append(f"{label} skipped: {missing}")
@@ -922,7 +975,8 @@ COLUMN_ORDER = [
     # animal (one set of values per run; age is per recording date)
     "mouse_number", "cage_number", "id_markers",
     "genotype", "strain", "animal_sex", "animal_dob", "age_days",
-    "file_membrane_test", "file_membrane_test_post", "file_steps", "file_hyperpol",
+    "file_membrane_test", "file_membrane_test_post", "file_steps",
+    "file_hyperpol", "file_sepsc",
     # membrane test (voltage clamp), before the step recordings ...
     "mt_Ra_MOhm", "mt_Ra_sd", "mt_Rm_MOhm", "mt_Rt_MOhm", "mt_Cm_pF", "mt_Cm_sd",
     "mt_tau_ms", "mt_Iss_pA", "mt_n_transients",
@@ -943,6 +997,13 @@ COLUMN_ORDER = [
     "AP_latency_ms", "max_firing_rate_Hz", "max_firing_rate_at_pA",
     "max_firing_sweep", "adaptation_index_at_max_rate",
     "half_max_sweep", "half_max_n_spikes", "half_max_stim_amp_pA",
+    # sEPSCs, from the gap-free recording
+    "sepsc_n_events", "sepsc_rate_Hz", "sepsc_duration_s",
+    "sepsc_amp_median_pA", "sepsc_amp_iqr_pA", "sepsc_rise_ms", "sepsc_decay_ms",
+    "sepsc_iei_median_ms", "sepsc_noise_pA", "sepsc_detection_limit_pA",
+    "sepsc_snr", "sepsc_holding_pA", "sepsc_holding_drift_pA",
+    "sepsc_amp_trend_pct", "sepsc_unmeasurable", "sepsc_thresh_sd",
+    "sepsc_kernel_source", "sepsc_kernel_ms", "sepsc_n_isolated",
     "files_unused", "notes", "folder",
 ]
 
@@ -1117,6 +1178,15 @@ def main(argv=None) -> int:
     p.add_argument("--protocol-steps", default="",
                    help="restrict the current-clamp step file to protocols whose "
                         "name contains this (default: any varying-step CC file)")
+    p.add_argument("--protocol-sepsc", default="gap_free",
+                   help="protocol name of the gap-free sEPSC recording "
+                        "(default 'gap_free'); falls back to any single-sweep "
+                        "voltage-clamp file")
+    p.add_argument("--sepsc-thresh-sd", type=float, default=None, metavar="SD",
+                   help="sEPSC detection threshold, in SDs of the deconvolved "
+                        "trace (default 6)")
+    p.add_argument("--no-sepsc", action="store_true",
+                   help="skip sEPSC detection, the slowest stage")
     p.add_argument("--protocol-hyperpol", default="hyperpol",
                    help="protocol name of a dedicated hyperpolarizing-steps file, "
                         "if the rig records one separately (default 'hyperpol')")

@@ -43,6 +43,8 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtWidgets
 
+import batch_sepsc
+
 # (column before, column after, label, unit, threshold, which side is bad)
 # The "after" column is None for everything measured from the step recording
 # itself, which happens once and so has no before/after to show.
@@ -59,6 +61,15 @@ QC_GUIDES = [
 # healthy both ends look on their own: it is the change, not the value, that
 # says the access was unstable while the F-I curve was being measured.
 RA_DRIFT_PCT = 20.0
+
+# sEPSC guides, in the same spirit: conventions, not measurements.
+# Below this ratio of median amplitude to noise SD the events being counted
+# are close enough to the noise floor that the RATE is the first thing to
+# become unreliable -- the detector finds whatever the threshold lets through.
+SEPSC_MIN_SNR = 3.0
+# Holding current moving by more than this over the recording means the
+# amplitudes at one end are not comparable with the other.
+SEPSC_HOLD_DRIFT_PA = 20.0
 
 _app_ref = None      # keeps the QApplication alive when this module made it
 
@@ -112,9 +123,24 @@ def load_run(root: Path, summary: Optional[pd.DataFrame] = None) -> dict:
 
     sweeps: dict[str, pd.DataFrame] = {}
     steps_abf: dict[str, Path] = {}
+    sepsc_events: dict[str, pd.DataFrame] = {}
+    sepsc_waves: dict[str, dict] = {}
     for _i, row in summary.iterrows():
         name = str(row.get("folder_name", ""))
         folder = Path(str(row.get("folder", root / name)))
+
+        # sEPSCs are optional twice over: the cell may have no gap-free
+        # recording, and a run made before this stage existed has neither the
+        # column nor the files. Both simply leave the tab out.
+        sepsc = str(row.get("file_sepsc", "") or "")
+        if sepsc:
+            events = batch_sepsc.load_events(folder / sepsc)
+            waves = batch_sepsc.load_waveforms(folder / sepsc)
+            if events is not None and not events.empty:
+                sepsc_events[name] = events
+            if waves is not None and waves.get("waveforms", np.zeros(0)).size:
+                sepsc_waves[name] = waves
+
         steps = str(row.get("file_steps", "") or "")
         if not steps:
             continue
@@ -127,7 +153,8 @@ def load_run(root: Path, summary: Optional[pd.DataFrame] = None) -> dict:
                 sweeps[name] = pd.read_csv(csv)
             except Exception:
                 pass
-    return {"root": root, "summary": summary, "sweeps": sweeps, "abf": steps_abf}
+    return {"root": root, "summary": summary, "sweeps": sweeps, "abf": steps_abf,
+            "sepsc_events": sepsc_events, "sepsc_waves": sepsc_waves}
 
 
 def _num(row, key) -> float:
@@ -181,6 +208,16 @@ def _flagged(summary: pd.DataFrame) -> dict[str, list[str]]:
             d = _num(row, "mt_Ra_change_pct")
             if np.isfinite(d) and abs(d) > RA_DRIFT_PCT:
                 flag(row, f"Ra drifted {d:+.0f}%")
+
+    for _i, row in summary.iterrows():
+        snr = _num(row, "sepsc_snr")
+        if np.isfinite(snr) and snr < SEPSC_MIN_SNR:
+            flag(row, f"sEPSC SNR {snr:.1f}")
+        hold = _num(row, "sepsc_holding_drift_pA")
+        if np.isfinite(hold) and abs(hold) > SEPSC_HOLD_DRIFT_PA:
+            flag(row, f"holding drifted {hold:+.0f} pA")
+        if str(row.get("sepsc_kernel_source", "")) == "analytic-fallback":
+            flag(row, "sEPSC kernel not estimated from the data")
     return out
 
 
@@ -203,6 +240,10 @@ class QCWindow(QtWidgets.QMainWindow):
         tabs.addTab(self._wrap(self._fi_figure()), "F-I curves")
         tabs.addTab(self._wrap(self._health_figure()), "Cell health")
         tabs.addTab(self._traces_tab(), "Traces")
+        # Only when something was actually detected: a batch of current-clamp
+        # recordings has no gap-free files and should not get an empty tab.
+        if run.get("sepsc_events") or run.get("sepsc_waves"):
+            tabs.addTab(self._wrap(self._sepsc_figure()), "sEPSCs")
         self.setCentralWidget(tabs)
 
         n_flagged = len(self.flags)
@@ -371,6 +412,180 @@ class QCWindow(QtWidgets.QMainWindow):
                      "guides are conventions, editable in batch_qc_window.py)",
                      fontsize=10)
         return fig
+
+    # -- tab 4: sEPSCs --------------------------------------------------
+    #: Top row of the sEPSC tab. Chosen to answer "is this recording usable",
+    #: not "what is this cell doing".
+    #: (column, label, unit, threshold, which side is bad)
+    SEPSC_METRICS = [
+        ("sepsc_rate_Hz",          "Event rate",       "Hz", None, None),
+        ("sepsc_amp_median_pA",    "Median amplitude", "pA", None, None),
+        ("sepsc_snr",              "SNR",              "",   SEPSC_MIN_SNR, "below"),
+        ("sepsc_holding_drift_pA", "Holding drift",    "pA", SEPSC_HOLD_DRIFT_PA, "abs"),
+    ]
+
+    #: Individual events drawn per cell in the overlay panels. The mean is
+    #: computed from all of them; this only limits what is drawn behind it.
+    SEPSC_OVERLAY_N = 80
+
+    def _sepsc_figure(self) -> Figure:
+        fig = Figure(figsize=(13, 8.6), tight_layout=True)
+        # Four metrics across the top, three plots across the bottom: a
+        # 12-column grid divides evenly into both.
+        grid = fig.add_gridspec(2, 12)
+        waves_by_cell = self.run.get("sepsc_waves", {})
+        events_by_cell = self.run.get("sepsc_events", {})
+
+        for k, (col, label, unit, thresh, side) in enumerate(self.SEPSC_METRICS):
+            ax = fig.add_subplot(grid[0, 3 * k:3 * k + 3])
+            self._sepsc_metric(ax, col, label, unit, thresh, side)
+
+        ax_raw = fig.add_subplot(grid[1, 0:4])
+        ax_scaled = fig.add_subplot(grid[1, 4:8])
+        ax_amp = fig.add_subplot(grid[1, 8:12])
+
+        for name in self.names:
+            wf = waves_by_cell.get(name)
+            if wf is None:
+                continue
+            waves = np.asarray(wf["waveforms"], dtype=float)
+            t = np.asarray(wf["t_ms"], dtype=float)
+            if waves.size == 0:
+                continue
+            colour = self.colors[name]
+            step = max(1, waves.shape[0] // self.SEPSC_OVERLAY_N)
+            for w in waves[::step]:
+                ax_raw.plot(t, w, lw=0.4, color=colour, alpha=0.12, zorder=1)
+            ax_raw.plot(t, waves.mean(axis=0), lw=1.8, color=colour, zorder=3,
+                        label=f"{_short(name)} (n={waves.shape[0]})")
+
+            # Scaled by each event's own measured amplitude, so every trace
+            # peaks at -1 and only the kinetics are left to differ. A cell
+            # whose events are a different shape shows up here even when its
+            # amplitudes look ordinary.
+            amps = np.abs(np.asarray(wf["amplitude"], dtype=float))
+            ok = amps > 0
+            if ok.any():
+                scaled = waves[ok] / amps[ok][:, None]
+                for w in scaled[::step]:
+                    ax_scaled.plot(t, w, lw=0.4, color=colour, alpha=0.12, zorder=1)
+                ax_scaled.plot(t, scaled.mean(axis=0), lw=1.8, color=colour, zorder=3)
+
+        # Scaled traces sit at -1 at the peak by construction, so the useful
+        # range is small and fixed. Without a limit one event riding on a
+        # neighbour's decay -- scaled by a small amplitude, so enormous --
+        # flattens every other trace into the top of the panel.
+        ax_scaled.set_ylim(-3.0, 1.0)
+
+        for ax, title, ylabel in (
+                (ax_raw, "Detected events, overlaid", "current (pA)"),
+                (ax_scaled, "The same events, scaled to their own peak", "peak = -1")):
+            ax.axhline(0.0, color="#bbbbbb", lw=0.8, ls=":", zorder=2)
+            ax.axvline(0.0, color="#bbbbbb", lw=0.8, ls=":", zorder=2)
+            ax.set_xlabel("time from peak (ms)", fontsize=8)
+            ax.set_ylabel(ylabel, fontsize=8)
+            ax.set_title(title, fontsize=9.5)
+            ax.tick_params(labelsize=7.5)
+            ax.grid(alpha=0.2)
+        if waves_by_cell:
+            ax_raw.legend(fontsize=7, loc="lower right", framealpha=0.9)
+
+        self._sepsc_amplitude_scatter(ax_amp, events_by_cell)
+
+        fig.suptitle("Spontaneous EPSCs, detected by deconvolution   "
+                     "(red = trips a QC guide; guides are conventions, "
+                     "editable in batch_qc_window.py)", fontsize=10)
+        return fig
+
+    def _sepsc_metric(self, ax, col, label, unit, thresh, side) -> None:
+        """One per-cell metric panel, with its guide and the noise floor."""
+        vals = self._column(col)
+        limits = self._column("sepsc_detection_limit_pA")
+        show_limit = col == "sepsc_amp_median_pA"
+
+        for i, name in enumerate(self.names):
+            v = vals.iloc[i] if i < len(vals) else np.nan
+            if not np.isfinite(v):
+                continue
+            if thresh is None:
+                bad = False
+            elif side == "abs":
+                bad = abs(v) > thresh
+            else:
+                bad = v > thresh if side == "above" else v < thresh
+            # The gap between a cell's median event and its own noise floor is
+            # the headroom the rate depends on, and it is per cell -- one
+            # shared guide line could not show it.
+            if show_limit and i < len(limits) and np.isfinite(limits.iloc[i]):
+                ax.vlines(i, limits.iloc[i], v, color=self.colors[name],
+                          lw=1.2, alpha=0.45, zorder=2)
+                ax.plot([i], [limits.iloc[i]], "_", ms=13, color="#777777", zorder=3)
+            ax.plot([i], [v], "o", ms=10,
+                    color="#d62728" if bad else self.colors[name],
+                    markeredgecolor="black" if bad else "none", zorder=4)
+            ax.annotate(f"{v:.1f}", (i, v), textcoords="offset points",
+                        xytext=(0, 11), ha="center", fontsize=7.5)
+
+        if show_limit:
+            ax.plot([], [], "_", color="#777777", label="detection limit (4x noise)")
+            ax.legend(fontsize=7, loc="best")
+        elif thresh is not None:
+            for level in ((thresh, -thresh) if side == "abs" else (thresh,)):
+                ax.axhline(level, color="#d62728", ls="--", lw=1.0, alpha=0.8)
+            ax.plot([], [], ls="--", color="#d62728",
+                    label=f"QC guide {thresh:g}{' ' + unit if unit else ''}")
+            ax.legend(fontsize=7, loc="best")
+
+        ax.set_xticks(np.arange(len(self.names)))
+        ax.set_xticklabels([_short(n) for n in self.names],
+                           rotation=30, ha="right", fontsize=7.5)
+        ax.set_title(f"{label} ({unit})" if unit else label, fontsize=10)
+        if len(self.names):
+            ax.set_xlim(-0.6, len(self.names) - 0.4)
+        ax.margins(y=0.25)
+        ax.grid(axis="y", alpha=0.25)
+
+    def _sepsc_amplitude_scatter(self, ax, events_by_cell: dict) -> None:
+        """Every event's amplitude against when it happened.
+
+        The point of plotting all of them rather than a summary is drift: a
+        cell whose amplitudes sag through the recording has a median that
+        still looks perfectly reasonable. The binned median line is there so
+        that trend is readable through the scatter.
+        """
+        for name in self.names:
+            ev = events_by_cell.get(name)
+            if ev is None or ev.empty:
+                continue
+            t = pd.to_numeric(ev["peak_time_s"], errors="coerce").to_numpy(float)
+            a = np.abs(pd.to_numeric(ev["amplitude"], errors="coerce").to_numpy(float))
+            ok = np.isfinite(t) & np.isfinite(a)
+            t, a = t[ok], a[ok]
+            if t.size == 0:
+                continue
+            ax.plot(t, a, ".", ms=2.5, alpha=0.35, color=self.colors[name], zorder=1)
+
+            n_bins = min(20, max(2, t.size // 15))
+            edges = np.linspace(t.min(), t.max(), n_bins + 1)
+            which = np.clip(np.digitize(t, edges) - 1, 0, n_bins - 1)
+            centres, medians = [], []
+            for b in range(n_bins):
+                in_bin = a[which == b]
+                if in_bin.size:
+                    centres.append(0.5 * (edges[b] + edges[b + 1]))
+                    medians.append(float(np.median(in_bin)))
+            if centres:
+                ax.plot(centres, medians, "-", lw=1.8, color=self.colors[name],
+                        zorder=3, label=f"{_short(name)} median")
+
+        ax.set_xlabel("time in recording (s)", fontsize=8)
+        ax.set_ylabel("event amplitude (pA)", fontsize=8)
+        ax.set_title("Amplitude against time\n(line = binned median; a sag is run-down)",
+                     fontsize=9.5)
+        ax.tick_params(labelsize=7.5)
+        ax.grid(alpha=0.2)
+        if events_by_cell:
+            ax.legend(fontsize=7, loc="best", framealpha=0.9)
 
     # -- tab 3: traces --------------------------------------------------
     def _traces_tab(self) -> QtWidgets.QWidget:
