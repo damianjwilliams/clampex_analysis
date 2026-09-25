@@ -1,6 +1,11 @@
 """PyQt5 window that shows, at a glance, whether a batch of recordings is any
 good: the F-I curves of every cell overlaid, the cell-health measurements side
-by side against QC guides, and the raw traces behind them.
+by side against QC guides, and the raw traces behind them -- each cell at
+rheobase, at half its maximum firing rate, and at the maximum.
+
+The half-max sweep is the one worth looking hardest at: it sits on the steep
+part of the F-I curve, where a cell that is unhealthy or poorly clamped
+departs from a healthy one soonest.
 
 Access resistance and capacitance are shown twice per cell -- from the
 membrane test before the step recordings and the one after -- joined by a
@@ -137,6 +142,15 @@ def _num(row, key) -> float:
     except (TypeError, ValueError):
         return float("nan")
     return v
+
+
+def _short(name: str) -> str:
+    """A cell folder name without its leading YYMMDD_.
+
+    With one recording date per run the date is identical on every cell, so it
+    is pure width -- whether on an axis tick or a three-across panel title.
+    """
+    return re.sub(r"^\d{6}_", "", name)
 
 
 def _flagged(summary: pd.DataFrame) -> dict[str, list[str]]:
@@ -339,9 +353,7 @@ class QCWindow(QtWidgets.QMainWindow):
                            label=f"QC guide {thresh:g} {unit}")
                 ax.legend(fontsize=7, loc="best")
             ax.set_xticks(x)
-            # Drop the leading YYMMDD_ from the tick labels; with one date per
-            # run it is the same on every cell and just eats axis width.
-            ax.set_xticklabels([re.sub(r"^\d{6}_", "", n) for n in self.names],
+            ax.set_xticklabels([_short(n) for n in self.names],
                                rotation=30, ha="right", fontsize=7.5)
             title = f"{label} ({unit})"
             if paired:
@@ -373,14 +385,30 @@ class QCWindow(QtWidgets.QMainWindow):
         scroll.setWidget(page)
         return scroll
 
+    # Left to right, the order the cell passes through them as the injected
+    # current grows: the first sweep that fires at all, the one firing at half
+    # its maximum rate, and the maximum itself. The half-max sweep is the one
+    # worth looking hardest at -- it is on the steep part of the F-I curve,
+    # where a cell that is unhealthy or badly clamped shows it first.
+    # (sweep column, label, current column, second number, its format)
+    TRACE_COLUMNS = [
+        ("rheobase_sweep", "rheobase", "rheobase_pA", None, ""),
+        ("half_max_sweep", "half-max firing", "half_max_stim_amp_pA",
+         "half_max_n_spikes", "{:.0f} APs"),
+        ("max_firing_sweep", "max firing", "max_firing_rate_at_pA",
+         "max_firing_rate_Hz", "{:.0f} Hz"),
+    ]
+
     def _traces_figure(self) -> Figure:
         rows = max(1, len(self.names))
+        ncols = len(self.TRACE_COLUMNS)
         fig = Figure(figsize=(12, 2.6 * rows), tight_layout=True)
         for i, name in enumerate(self.names):
             row = self.summary.iloc[i]
             abf_path = self.run["abf"].get(name)
-            axes = [fig.add_subplot(rows, 2, 2 * i + 1), fig.add_subplot(rows, 2, 2 * i + 2)]
+            axes = [fig.add_subplot(rows, ncols, ncols * i + k + 1) for k in range(ncols)]
             for ax in axes:
+                ax.set_xlabel("time (s)", fontsize=8)
                 ax.set_ylabel("Vm (mV)", fontsize=8)
                 ax.tick_params(labelsize=7.5)
             if abf_path is None:
@@ -398,9 +426,7 @@ class QCWindow(QtWidgets.QMainWindow):
                              transform=axes[0].transAxes, color="#b00020")
                 continue
 
-            wanted = [("rheobase_sweep", "rheobase", "rheobase_pA"),
-                      ("max_firing_sweep", "max firing", "max_firing_rate_at_pA")]
-            for ax, (key, what, amp_key) in zip(axes, wanted):
+            for ax, (key, what, amp_key, extra_key, extra_fmt) in zip(axes, self.TRACE_COLUMNS):
                 sw = _num(row, key)
                 if not np.isfinite(sw):
                     ax.text(0.5, 0.5, f"no {what} sweep", ha="center", va="center",
@@ -410,10 +436,17 @@ class QCWindow(QtWidgets.QMainWindow):
                 ax.axhline(0.0, color="#bbbbbb", lw=0.8, ls=":", zorder=1)
                 ax.plot(abf.sweepX, abf.sweepY, lw=0.6, color=self.colors[name], zorder=2)
                 amp = _num(row, amp_key)
-                amp_txt = f"{amp:.0f} pA" if np.isfinite(amp) else "?"
-                ax.set_title(f"{name}  -  {what} sweep {int(sw)} ({amp_txt})", fontsize=8.5)
-            axes[1].set_xlabel("time (s)", fontsize=8)
-            axes[0].set_xlabel("time (s)", fontsize=8)
+                # Each panel carries the number that defines it: the current
+                # for rheobase, the spike count for half-max, the rate for the
+                # maximum -- so the three are comparable without the F-I tab.
+                bits = [f"{amp:.0f} pA" if np.isfinite(amp) else "?"]
+                extra = _num(row, extra_key) if extra_key else float("nan")
+                if np.isfinite(extra):
+                    bits.append(extra_fmt.format(extra))
+                # Three panels across leave no room for the repeated YYMMDD_,
+                # which the Cell health tab drops from its tick labels too.
+                ax.set_title(f"{_short(name)}  -  {what} sweep {int(sw)} "
+                             f"({', '.join(bits)})", fontsize=8.5)
         return fig
 
 

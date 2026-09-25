@@ -91,15 +91,16 @@ and one row per cell at the root:
 
     batch_cell_summary.csv
 
-Animal details
---------------
-Run with no folder argument and a dialog collects both the experiment folder
-and the animal it came from -- which mouse it was (number, cage, ID markers)
-and its date of birth, sex, genotype and strain -- and says how many cell
-folders it found before anything is analysed. Those details are written to
-every row of the summary, and the date of birth gives each cell an
-``age_days`` (its folder's date minus the DOB), so cells from different
-litters stay distinguishable once the summaries are pooled.
+Run details
+-----------
+Run with no folder argument and a dialog collects the experiment folder, what
+was recorded (brain region, cell type) and the animal it came from -- which
+mouse it was (number, cage, ID markers) and its date of birth, sex, genotype
+and strain -- and says how many cell folders it found before anything is
+analysed. Those details are written to every row of the summary, and the date
+of birth gives each cell an ``age_days`` (its folder's date minus the DOB),
+so cells from different litters stay distinguishable once the summaries are
+pooled.
 
 The animal is identified by three fields rather than one because no single
 one of them is reliable on its own: a mouse number is only unique within its
@@ -107,15 +108,21 @@ cage, a cage number changes when animals are moved, and the ID markers (ear
 punch, tail marks, tag) are what is readable on the animal at the rig. All
 three are recorded so a cell can still be traced back when one is wrong.
 
-The same fields are available as flags (``--mouse``, ``--cage``,
-``--id-markers``, ``--dob``, ``--sex``, ``--genotype``, ``--strain``) for
-scripted runs, and ``--no-gui`` skips the dialog.
+Brain region and cell type are one value each for the whole run, which the
+animal's genotype genuinely is but they are not: a session that patched two
+regions, or two cell types in one region, needs a run per group or the
+``brain_region`` / ``cell_type`` column edited afterwards.
+
+The same fields are available as flags (``--brain-region``, ``--cell-type``,
+``--mouse``, ``--cage``, ``--id-markers``, ``--dob``, ``--sex``,
+``--genotype``, ``--strain``) for scripted runs, and ``--no-gui`` skips the
+dialog.
 
 When the run finishes, a QC window opens (``batch_qc_window.py``): the F-I
 curves of every cell overlaid, the cell-health measurements side by side
 against QC guides -- Ra and Cm shown before and after the recordings, joined
-by a line, so a cell that ran down is obvious -- and each cell's rheobase and
-max-firing traces.
+by a line, so a cell that ran down is obvious -- and each cell's traces at
+rheobase, at half its maximum firing rate, and at the maximum.
 ``--no-window`` skips it; ``--view`` reopens it later for a folder that has
 already been analysed, without re-running anything.
 
@@ -123,6 +130,7 @@ Usage
 -----
     python batch_cell_analysis.py                     # dialog: folder + animal
     python batch_cell_analysis.py DATA_ROOT
+    python batch_cell_analysis.py DATA_ROOT --brain-region CA1 --cell-type pyramidal
     python batch_cell_analysis.py DATA_ROOT --mouse 3 --cage 1234567 \
         --id-markers "ear punch R" --dob 2026-06-01 --sex male \
         --genotype "Sst-Cre;Ai14" --strain C57BL/6J
@@ -838,11 +846,11 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
     row.update({k: v for k, v in meta.items() if k != "unparsed_name"})
     notes: list[str] = []
 
-    # Animal details are per run; age is per cell, since a root folder can hold
-    # more than one recording date.
-    animal = getattr(opts, "animal", None) or {}
-    row.update(animal)
-    age = age_days(animal.get("animal_dob", ""), meta.get("date", ""))
+    # The animal, the region and the cell type are per run; age is per cell,
+    # since a root folder can hold more than one recording date.
+    details = getattr(opts, "run_details", None) or {}
+    row.update(details)
+    age = age_days(details.get("animal_dob", ""), meta.get("date", ""))
     row["age_days"] = age if age is not None else ""
     if age is not None and age < 0:
         notes.append(f"recording date precedes the date of birth by {-age} days")
@@ -909,6 +917,8 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
 # ---------------------------------------------------------------------------
 COLUMN_ORDER = [
     "folder_name", "date", "slice", "cell", "rmp_folder_mV", "label",
+    # what was recorded (one set of values per run)
+    "brain_region", "cell_type",
     # animal (one set of values per run; age is per recording date)
     "mouse_number", "cage_number", "id_markers",
     "genotype", "strain", "animal_sex", "animal_dob", "age_days",
@@ -1114,6 +1124,10 @@ def main(argv=None) -> int:
                    help="dV/dt spike-detection threshold in mV/ms (default 20)")
     p.add_argument("--min-peak", type=float, default=-30.0,
                    help="minimum AP peak voltage in mV (default -30)")
+    p.add_argument("--brain-region", default="", metavar="TEXT",
+                   help="region the cells were recorded in, e.g. CA1")
+    p.add_argument("--cell-type", default="", metavar="TEXT",
+                   help="what the recorded cells were, e.g. pyramidal")
     p.add_argument("--mouse", default="", metavar="N",
                    help="the animal's number; usually unique only within its cage")
     p.add_argument("--cage", default="", metavar="N",
@@ -1127,9 +1141,9 @@ def main(argv=None) -> int:
     p.add_argument("--strain", default="", help="animal's strain, e.g. C57BL/6J")
     p.add_argument("--gui", action="store_true",
                    help="open the dialog even when a folder is given, pre-filled "
-                        "with it -- e.g. to add the animal details to a re-run")
+                        "with it -- e.g. to add the run details to a re-run")
     p.add_argument("--no-gui", action="store_true",
-                   help="skip the animal-details dialog and just pick a folder")
+                   help="skip the run-details dialog and just pick a folder")
     p.add_argument("--no-window", action="store_true",
                    help="don't open the QC window when the run finishes")
     p.add_argument("--view", action="store_true",
@@ -1146,14 +1160,16 @@ def main(argv=None) -> int:
 
     if args.dob and age_days(args.dob, "000101") is None:
         p.error(f"--dob must be a calendar date as YYYY-MM-DD, not {args.dob!r}")
-    args.animal = {"mouse_number": args.mouse.strip(), "cage_number": args.cage.strip(),
-                   "id_markers": args.id_markers.strip(),
-                   "genotype": args.genotype.strip(), "strain": args.strain.strip(),
-                   "animal_sex": args.sex.strip(), "animal_dob": args.dob.strip()}
+    args.run_details = {
+        "brain_region": args.brain_region.strip(), "cell_type": args.cell_type.strip(),
+        "mouse_number": args.mouse.strip(), "cage_number": args.cage.strip(),
+        "id_markers": args.id_markers.strip(),
+        "genotype": args.genotype.strip(), "strain": args.strain.strip(),
+        "animal_sex": args.sex.strip(), "animal_dob": args.dob.strip()}
 
-    # With no folder argument, the dialog collects the folder AND the animal
+    # With no folder argument, the dialog collects the folder AND the run
     # details in one step; --no-gui (or a missing PyQt5) falls back to a plain
-    # folder picker, leaving the animal columns to the flags above.
+    # folder picker, leaving those columns to the flags above.
     root: Optional[Path] = Path(args.root) if args.root else None
     if (root is None or args.gui) and not args.no_gui:
         try:
@@ -1167,7 +1183,7 @@ def main(argv=None) -> int:
                 print("Cancelled.")
                 return 1
             root = Path(chosen.pop("root"))
-            args.animal.update(chosen)
+            args.run_details.update(chosen)
     if root is None:
         picked = pick_root_folder()
         if not picked:

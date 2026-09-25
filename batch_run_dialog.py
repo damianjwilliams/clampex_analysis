@@ -1,6 +1,13 @@
-"""PyQt5 dialog that starts a batch run: pick the experiment folder and record
-the animal it came from -- which mouse it was, and its date of birth, sex,
-genotype and strain.
+"""PyQt5 dialog that starts a batch run: pick the experiment folder, say what
+was recorded -- brain region and cell type -- and record the animal it came
+from: which mouse it was, and its date of birth, sex, genotype and strain.
+
+Region and cell type are kept apart from the animal because they describe
+what the electrode was on rather than what it came from. One of each is
+applied to the whole run, which is a real limitation where the animal's
+genotype is not: a session that patched two regions, or two cell types in one
+region, needs a run per group or the column edited afterwards. The dialog
+says so.
 
 Which mouse is three fields rather than one, because no single one of them is
 reliable on its own: the mouse number is only unique within a cage, the cage
@@ -150,6 +157,35 @@ class RunDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         animal_layout.addWidget(note)
 
+        # -- recording -------------------------------------------------
+        # Separate from the animal because these describe what the electrode
+        # was on, not what it came from -- the same animal yields cells in
+        # more than one region, and more than one cell type in each.
+        self.region_combo = self._history_combo(
+            "brain_region", "e.g. CA1, mPFC, dorsal striatum")
+        self.cell_type_combo = self._history_combo(
+            "cell_type", "e.g. pyramidal, SST interneuron, MSN")
+        self.region_combo.setToolTip("The region the recorded cells were in.")
+        self.cell_type_combo.setToolTip("What the recorded cells were, as far as "
+                                        "it is known at the rig.")
+
+        rec_form = QtWidgets.QFormLayout()
+        rec_form.addRow("Brain region", self.region_combo)
+        rec_form.addRow("Cell type", self.cell_type_combo)
+
+        rec_box = QtWidgets.QGroupBox("Recording")
+        rec_layout = QtWidgets.QVBoxLayout(rec_box)
+        rec_layout.addLayout(rec_form)
+        # Worth saying explicitly here and not under Animal: an animal's
+        # genotype really is one value for the run, but region and cell type
+        # are per cell, and this dialog can only apply one of each.
+        rec_note = QtWidgets.QLabel(
+            "Applied to every cell in this run. Analyse a run per region or "
+            "cell type if they differ, or edit the column afterwards.")
+        rec_note.setStyleSheet("color: #898781;")
+        rec_note.setWordWrap(True)
+        rec_layout.addWidget(rec_note)
+
         buttons = QtWidgets.QDialogButtonBox()
         self.run_btn = buttons.addButton("Run analysis", QtWidgets.QDialogButtonBox.AcceptRole)
         buttons.addButton(QtWidgets.QDialogButtonBox.Cancel)
@@ -158,6 +194,7 @@ class RunDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(folder_box)
+        layout.addWidget(rec_box)
         layout.addWidget(animal_box)
         layout.addWidget(buttons)
 
@@ -248,6 +285,8 @@ class RunDialog(QtWidgets.QDialog):
     def values(self) -> dict:
         return {
             "root": self.root,
+            "brain_region": self.region_combo.currentText().strip(),
+            "cell_type": self.cell_type_combo.currentText().strip(),
             "mouse_number": self.mouse_combo.currentText().strip(),
             "cage_number": self.cage_combo.currentText().strip(),
             "id_markers": self.markers_combo.currentText().strip(),
@@ -267,7 +306,8 @@ class RunDialog(QtWidgets.QDialog):
         self.settings.setValue("dob", self.dob_edit.date().toString("yyyy-MM-dd"))
         self.settings.setValue("dob_unknown", self.dob_unknown.isChecked())
         self.settings.setValue("sex", v["animal_sex"])
-        for key in ("mouse_number", "cage_number", "id_markers", "genotype", "strain"):
+        for key in ("brain_region", "cell_type", "mouse_number", "cage_number",
+                    "id_markers", "genotype", "strain"):
             self.settings.setValue(key + "_last", v[key])
             _remember(self.settings, key, v[key])
         super().accept()
