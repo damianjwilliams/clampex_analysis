@@ -251,11 +251,11 @@ class RunDialog(QtWidgets.QDialog):
 def prompt_for_run(initial_root: Optional[Path] = None) -> Optional[dict]:
     """Show the dialog. Returns the chosen folder and animal details, or None
     if it was cancelled."""
-    app = QtWidgets.QApplication.instance()
-    owns_app = app is None
-    if owns_app:
-        import sys
-        app = QtWidgets.QApplication(sys.argv[:1])
+    # Shared with the QC window so both honour Windows display scaling; the
+    # attributes it sets only take effect before a QApplication exists.
+    from batch_qc_window import qt_app
+    app = qt_app()
+    owns_app = False
     dlg = RunDialog(initial_root)
     accepted = dlg.exec_() == QtWidgets.QDialog.Accepted
     values = dlg.values() if accepted else None

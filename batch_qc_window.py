@@ -46,6 +46,35 @@ QC_GUIDES = [
 _app_ref = None      # keeps the QApplication alive when this module made it
 
 
+def qt_app() -> QtWidgets.QApplication:
+    """The QApplication, made with high-DPI scaling on if it doesn't exist yet.
+
+    Windows display scaling (150% here) makes the screen report a logical DPI
+    of 144 while Qt still reports a device pixel ratio of 1, so widget chrome
+    is laid out large while the matplotlib canvases render at 100 dpi -- the
+    figures come out cramped and their text oversized relative to the axes.
+    These attributes have to be set BEFORE the QApplication exists, so a
+    process that already made one keeps whatever it chose.
+    """
+    global _app_ref
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        return app
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    # Qt 5 rounds a scale factor by default, so Windows' 150% becomes 200% and
+    # a 1920x1200 display shrinks to 960x600 of usable layout space. Pass the
+    # fractional factor through instead, so the window matches the size
+    # everything else on the desktop is drawn at.
+    try:
+        QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(
+            QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    except AttributeError:          # Qt < 5.14
+        pass
+    _app_ref = app = QtWidgets.QApplication(sys.argv[:1])
+    return app
+
+
 # ---------------------------------------------------------------------------
 # Loading a finished run
 # ---------------------------------------------------------------------------
@@ -144,7 +173,14 @@ class QCWindow(QtWidgets.QMainWindow):
         else:
             msg += "  No cell trips a QC guide."
         self.statusBar().showMessage(msg)
-        self.resize(1250, 820)
+
+        # Fit the screen rather than assuming one: at 150% scaling a 1920x1200
+        # display is only 1280x800 logical pixels, so a hardcoded 1250x820
+        # window is taller than the desktop and the status bar falls off it.
+        screen = QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1250, 820)
+        self.resize(min(1250, int(avail.width() * 0.95)),
+                    min(860, int(avail.height() * 0.92)))
 
     def _wrap(self, fig: Figure) -> QtWidgets.QWidget:
         """A figure plus the matplotlib toolbar, so anything can be zoomed and
@@ -215,9 +251,11 @@ class QCWindow(QtWidgets.QMainWindow):
 
         ax.set_xlabel("injected current (pA)")
         ax.set_ylabel("firing rate (Hz)")
-        ax.set_title("F-I curves, all cells overlaid   (marker = rheobase; label = "
-                     "resting Vm at 0 pA and the amplifier's holding current; "
-                     "'rig' = the folder name's RMP)")
+        # Two short lines: one long title is the first thing to clip when the
+        # window is narrower than the machine it was laid out on.
+        ax.set_title("F-I curves, all cells overlaid\n"
+                     "marker = rheobase, label = resting Vm at 0 pA "
+                     "and holding current", fontsize=10)
         ax.grid(alpha=0.25)
         if plotted:
             ax.legend(fontsize=8, loc="upper left", framealpha=0.9)
@@ -268,7 +306,8 @@ class QCWindow(QtWidgets.QMainWindow):
         # rather than squeezing ten cells into 800 px.
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
-        page.setMinimumHeight(int(fig.get_figheight() * 96))
+        # Tie the scrollable height to the screen's real DPI, not a guessed 96
+        page.setMinimumHeight(int(fig.get_figheight() * max(72, self.logicalDpiY())))
         scroll.setWidget(page)
         return scroll
 
@@ -323,12 +362,8 @@ def show_qc_window(root: Path, summary: Optional[pd.DataFrame] = None,
                    block: bool = True) -> Optional[QCWindow]:
     """Open the QC window for a finished run. Blocks until it is closed when
     `block`, so a command-line run ends when the user is done looking."""
-    global _app_ref
     run = load_run(Path(root), summary)
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv[:1])
-        _app_ref = app
+    app = qt_app()
     win = QCWindow(run)
     win.show()
     win.raise_()
