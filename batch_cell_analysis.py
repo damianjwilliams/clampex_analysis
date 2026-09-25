@@ -97,6 +97,12 @@ different litters stay distinguishable once the summaries are pooled. The
 same fields are available as flags (``--dob``, ``--sex``, ``--genotype``,
 ``--strain``) for scripted runs, and ``--no-gui`` skips the dialog.
 
+When the run finishes, a QC window opens (``batch_qc_window.py``): the F-I
+curves of every cell overlaid, the cell-health measurements side by side
+against QC guides, and each cell's rheobase and max-firing traces.
+``--no-window`` skips it; ``--view`` reopens it later for a folder that has
+already been analysed, without re-running anything.
+
 Usage
 -----
     python batch_cell_analysis.py                     # dialog: folder + animal
@@ -105,6 +111,7 @@ Usage
         --genotype "Sst-Cre;Ai14" --strain C57BL/6J
     python batch_cell_analysis.py DATA_ROOT --no-plot
     python batch_cell_analysis.py DATA_ROOT --sag-target -85 --rin-v-floor -78
+    python batch_cell_analysis.py DATA_ROOT --view    # just show the QC window
     python batch_cell_analysis.py --selftest          # synthetic validation
 
 Requires: numpy, pandas, matplotlib, pyabf, ipfx, scipy.
@@ -654,12 +661,58 @@ def analyze_subthreshold(path: Path, opts) -> tuple[dict, list[str]]:
     return summary, written
 
 
+def holding_current(path: Path, max_sweeps: int = 10) -> dict:
+    """The bias (holding) current the amplifier was applying, in pA.
+
+    A bias current dialed in on the amplifier is added downstream of the
+    Clampex command, so it never appears in the command waveform (sweepC) or
+    in stim_amp_pA. It can only be seen on the recorded current-monitor
+    channel -- the MultiClamp's secondary output, telegraphed as a pA channel.
+    Measured over the pre-step baseline, where the protocol commands nothing,
+    and averaged over the first `max_sweeps` sweeps (the holding current does
+    not change between them, so this is just noise averaging).
+
+    The monitor carries its own offset, so a couple of pA is indistinguishable
+    from zero: this answers "was the cell held with a bias current", not "what
+    current flowed" to the last picoamp.
+    """
+    import pyabf
+    abf = pyabf.ABF(str(path))
+    v_ch = _channel_with_units(abf, ("mv",))
+    i_ch = _channel_with_units(abf, ("pa", "na", "a"))
+    if v_ch is None or i_ch is None:
+        return {}
+
+    scale = {"pa": 1.0, "na": 1e3, "a": 1e12}
+    vals = []
+    for sw in range(min(abf.sweepCount, max_sweeps)):
+        start, _end, _amp = stim_window(abf, sw, v_ch)
+        abf.setSweep(sw, channel=i_ch)
+        t = np.asarray(abf.sweepX, float)
+        if not np.isfinite(start) or start <= float(t[0]) + 1e-3:
+            continue          # gap-free or no pre-step baseline to average
+        i = np.asarray(abf.sweepY, float) * scale.get(
+            abf.sweepUnitsY.strip().lower(), 1.0)
+        vals.append(_mean_over(t, i, start - min(0.1, start - float(t[0])), start))
+
+    if not vals:
+        return {}
+    return {"bias_current_pA": float(np.mean(vals)),
+            "bias_current_sd_pA": float(np.std(vals))}
+
+
 def analyze_action_potentials(path: Path, opts) -> tuple[dict, list[str]]:
     """Rheobase / F-I / AP waveform, via autorun_AP_analysis."""
     result = ap.analyze_abf(str(path), dv_cutoff=opts.dv_cutoff,
                             min_peak_mV=opts.min_peak)
     summary = ap.cell_summary(result)
     summary["n_spikes_total"] = int(len(result["spikes"]))
+    # Measured from the same recording the F-I curve comes from, so the two
+    # always describe the cell in the same state.
+    try:
+        summary.update(holding_current(path))
+    except Exception as exc:
+        print(f"      note: holding current not measured ({exc})", file=sys.stderr)
     stem = str(path.with_suffix(""))
     result["spikes"].to_csv(f"{stem}_AP_spikes.csv", index=False)
     result["sweeps"].to_csv(f"{stem}_AP_sweeps.csv", index=False)
@@ -757,7 +810,7 @@ COLUMN_ORDER = [
     "mt_Ra_MOhm", "mt_Ra_sd", "mt_Rm_MOhm", "mt_Rt_MOhm", "mt_Cm_pF", "mt_Cm_sd",
     "mt_tau_ms", "mt_Iss_pA", "mt_n_transients",
     # subthreshold current clamp
-    "Vrest_measured_mV", "sag_target_mV", "sag_ratio", "sag_amplitude_mV",
+    "Vrest_measured_mV", "bias_current_pA", "bias_current_sd_pA", "sag_target_mV", "sag_ratio", "sag_amplitude_mV",
     "sag_v_peak_mV", "sag_stim_pA", "sag_bracketed", "sag_n_sweeps", "sag_note",
     "Rin_MOhm", "Rin_r2", "Rin_peak_MOhm", "Rin_n_sweeps",
     "Rin_I_min_pA", "Rin_I_max_pA", "Rin_V_min_mV", "Rin_V_max_mV",
@@ -776,6 +829,21 @@ COLUMN_ORDER = [
 def order_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in COLUMN_ORDER if c in df.columns]
     return df[cols + [c for c in df.columns if c not in cols]]
+
+
+def show_qc_window(root: Path, summary: "Optional[pd.DataFrame]" = None) -> bool:
+    """Open the end-of-run QC window. Never fatal: a headless machine, a
+    missing PyQt5 or a half-finished run must not lose the analysis that has
+    already been written to disk."""
+    try:
+        import batch_qc_window
+        batch_qc_window.show_qc_window(root, summary)
+        return True
+    except Exception as exc:
+        print(f"NOTE: could not open the QC window ({exc}). The summary and the "
+              f"per-cell files are still written; `--view` reopens it later.",
+              file=sys.stderr)
+        return False
 
 
 def pick_root_folder() -> Optional[str]:
@@ -945,6 +1013,11 @@ def main(argv=None) -> int:
                         "with it -- e.g. to add the animal details to a re-run")
     p.add_argument("--no-gui", action="store_true",
                    help="skip the animal-details dialog and just pick a folder")
+    p.add_argument("--no-window", action="store_true",
+                   help="don't open the QC window when the run finishes")
+    p.add_argument("--view", action="store_true",
+                   help="open the QC window for a folder already analysed, "
+                        "without re-running anything")
     p.add_argument("--traceback", action="store_true",
                    help="print a full traceback for each failing stage")
     p.add_argument("--selftest", action="store_true",
@@ -983,6 +1056,9 @@ def main(argv=None) -> int:
         root = Path(picked)
     if not root.is_dir():
         p.error(f"not a folder: {root}")
+
+    if args.view:
+        return 0 if show_qc_window(root) else 1
 
     cells = find_cell_folders(root, include_unparsed=args.include_unparsed)
     if not cells:
