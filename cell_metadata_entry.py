@@ -29,6 +29,9 @@ click to fix, and "Browse" reaches any file outside the candidate window.
 Saved file names go in one column per protocol, with their folder in the
 row's ``abf_dir`` column (a file browsed from elsewhere keeps its full path).
 
+A free-text Notes box goes with each cell: it is saved in the row's
+``notes`` column when the cell is added, then cleared for the next one.
+
 Saving also gathers the cell: the seven recordings are copied into
 ``<abf folder>/<yymmdd>_s<slice>_c<cell>_<RMP>/`` (RMP rounded to a whole
 number, e.g. ``260928_s1_c1_-70``) under slot-prefixed names
@@ -90,7 +93,8 @@ RA_WINDOWS = [
 RA_SLOTS = tuple(key for key, _after, _before in RA_WINDOWS)
 RA_PROTOCOL = "DW_Ra"
 FILE_KEYS = [f"file_{key}" for key, _l, _p, _w in PROTOCOL_SLOTS]
-FIELDNAMES = ["date", "slice", "cell", "rmp_mv", "genotype", "abf_dir"] + FILE_KEYS + ["entered_at"]
+FIELDNAMES = (["date", "slice", "cell", "rmp_mv", "genotype", "abf_dir"] + FILE_KEYS
+              + ["notes", "entered_at"])
 
 # How many of the most recent .abf files to offer. A full run is 7 files;
 # the extra headroom covers re-runs of a protocol and aborted sweeps, and
@@ -118,8 +122,19 @@ def _fieldnames_for(rows: list[dict]) -> list[str]:
     return FIELDNAMES + list(dict.fromkeys(extra))
 
 
+def _header(path: Path) -> list[str]:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        return next(csv.reader(fh), [])
+
+
 def append_row(path: Path, row: dict) -> None:
     new_file = not path.exists() or path.stat().st_size == 0
+    # A CSV from before a column was added (notes, extra slots) has a
+    # different header -- appending under FIELDNAMES would shift every value
+    # into the wrong column, so rewrite the file under the full header instead.
+    if not new_file and _header(path) != _fieldnames_for(read_rows(path)):
+        rewrite_rows(path, read_rows(path) + [{k: str(v) for k, v in row.items()}])
+        return
     with path.open("a", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=FIELDNAMES, extrasaction="ignore")
         if new_file:
@@ -296,6 +311,12 @@ def ra_lines(assignment: dict[str, Path], ra: dict[str, dict]) -> list[str]:
     return lines
 
 
+def notes_text(row: dict) -> str:
+    """The row's notes, continuation lines indented under the first."""
+    lines = (row.get("notes") or "").strip().splitlines()
+    return ("\n" + " " * 14).join(lines)
+
+
 def details_text(row: dict, assignment: dict[str, Path],
                  protocols: dict[str, str] | None = None,
                  ra: dict[str, dict] | None = None) -> str:
@@ -313,6 +334,7 @@ def details_text(row: dict, assignment: dict[str, Path],
         f"cell          {(row.get('cell') or '').strip()}",
         f"RMP (mV)      {(row.get('rmp_mv') or '').strip()}",
         f"genotype      {(row.get('genotype') or '').strip()}",
+        f"notes         {notes_text(row)}",
         f"entered at    {(row.get('entered_at') or '').strip()}",
         f"copied at     {dt.datetime.now().isoformat(timespec='seconds')}",
         "",
@@ -519,12 +541,19 @@ class MetadataWindow(QtWidgets.QWidget):
         self.genotype_combo.setCurrentText("")
         self.genotype_combo.lineEdit().returnPressed.connect(self.save_entry)
 
+        # Multi-line, so Return is a new line here -- Ctrl+Enter still adds the cell.
+        self.notes_edit = QtWidgets.QPlainTextEdit()
+        self.notes_edit.setPlaceholderText("Free-text notes for this cell (optional)")
+        self.notes_edit.setTabChangesFocus(True)
+        self.notes_edit.setFixedHeight(self.notes_edit.fontMetrics().lineSpacing() * 4 + 12)
+
         form = QtWidgets.QFormLayout()
         form.addRow("Date (YYMMDD)", self.date_edit)
         form.addRow("Slice #", self.slice_spin)
         form.addRow("Cell #", self.cell_spin)
         form.addRow("RMP", self.rmp_spin)
         form.addRow("Genotype", self.genotype_combo)
+        form.addRow("Notes", self.notes_edit)
 
         self.save_btn = QtWidgets.QPushButton("Add cell  (Ctrl+Enter)")
         self.save_btn.clicked.connect(self.save_entry)
@@ -544,9 +573,9 @@ class MetadataWindow(QtWidgets.QWidget):
         cell_layout.addLayout(form)
         cell_layout.addLayout(buttons)
 
-        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table = QtWidgets.QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Date", "Slice", "Cell", "RMP (mV)", "Genotype", "Files"])
+            ["Date", "Slice", "Cell", "RMP (mV)", "Genotype", "Files", "Notes"])
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QTableWidget.NoEditTriggers)
@@ -670,8 +699,11 @@ class MetadataWindow(QtWidgets.QWidget):
 
     def _row_cells(self, row: dict) -> list[str]:
         n_files = sum(1 for k in FILE_KEYS if (row.get(k) or "").strip())
+        # Notes may be multi-line; the table shows them on one line, with the
+        # full text in the tooltip.
+        notes = " ".join((row.get("notes") or "").split())
         return [str(row.get(k, "")) for k in ("date", "slice", "cell", "rmp_mv", "genotype")] \
-            + [f"{n_files}/{len(FILE_KEYS)}"]
+            + [f"{n_files}/{len(FILE_KEYS)}", notes]
 
     def _add_table_row(self, row: dict) -> None:
         r = self.table.rowCount()
@@ -681,7 +713,10 @@ class MetadataWindow(QtWidgets.QWidget):
 
     def _set_table_row(self, r: int, row: dict) -> None:
         for col, text in enumerate(self._row_cells(row)):
-            self.table.setItem(r, col, QtWidgets.QTableWidgetItem(text))
+            item = QtWidgets.QTableWidgetItem(text)
+            if col == 6 and text:
+                item.setToolTip((row.get("notes") or "").strip())
+            self.table.setItem(r, col, item)
 
     # -- save cell -----------------------------------------------------
     def save_entry(self) -> None:
@@ -720,6 +755,7 @@ class MetadataWindow(QtWidgets.QWidget):
             "cell": cell_no,
             "rmp_mv": f"{self.rmp_spin.value():.1f}",
             "genotype": genotype,
+            "notes": self.notes_edit.toPlainText().strip(),
             "entered_at": dt.datetime.now().isoformat(timespec="seconds"),
         }
         row.update({k: "" for k in FILE_KEYS})
@@ -733,6 +769,7 @@ class MetadataWindow(QtWidgets.QWidget):
         self._add_table_row(row)
         if self.genotype_combo.findText(genotype) < 0:
             self.genotype_combo.addItem(genotype)
+        self.notes_edit.clear()  # notes are per cell; date/slice/genotype carry over
         self.status.setText(f"Added {date} slice {slice_no} cell {cell_no}  ->  {self.csv_path.name}")
 
         # Advance the cell number for the next recording; date/slice/genotype
