@@ -1,6 +1,6 @@
 """PyQt5 form for logging per-cell recording metadata at the rig -- date
 (YYMMDD), slice number, cell number, RMP, genotype -- and then pairing that
-cell with the five .abf files of its protocol run.
+cell with the seven .abf files of its protocol run.
 
 Rows are appended to a CSV (default ``cell_metadata.csv``), and that CSV is
 also the memory: on startup the last row prefills the form, so date/slice/
@@ -10,18 +10,35 @@ starting point, not a constraint.
 
 Adding a cell reveals the protocol panel, which scans the ABF folder,
 takes the most recent recordings, reads each one's Clampex protocol name
-out of its header (via pyabf) and pre-pairs them with the five slots:
+out of its header (via pyabf) and pre-pairs them with the seven slots of a
+run -- a membrane test before and after every stimulus protocol:
 
-    Initial membrane test    DW_Ra                 (first DW_Ra of the run)
-    Hyperpolarizing steps    DW_hyperpolarizing
-    Depolarizing steps       DW_IC
-    sEPSCs                   DW_Gap_free_-70_mV
-    Final membrane test      DW_Ra                 (last DW_Ra of the run)
+    Membrane test 1          DW_Ra
+    Depolarizing steps       IC_IV
+    Membrane test 2          DW_Ra
+    Hyperpolarizing steps    IC_hyper
+    Membrane test 3          DW_Ra
+    sEPSCs (-70 mV, 2 min)   DW_Gap_free_-70_mV
+    Membrane test 4          DW_Ra
+
+The four membrane tests share one protocol name, so they are told apart by
+which gap between the stimulus protocols they fall in, not by name.
 
 Every slot is a dropdown over the candidate files, so a mismatch is one
 click to fix, and "Browse" reaches any file outside the candidate window.
 Saved file names go in one column per protocol, with their folder in the
 row's ``abf_dir`` column (a file browsed from elsewhere keeps its full path).
+
+Saving also gathers the cell: the seven recordings are copied into
+``<abf folder>/<yymmdd>_s<slice>_c<cell>_<RMP>/`` (RMP rounded to a whole
+number, e.g. ``260928_s1_c1_-70``) under slot-prefixed names
+(``hyperpol_2026_09_28_0010.abf``), alongside a ``.txt`` of the cell's
+details and what each file was copied from. Re-saving overwrites that
+folder's copies, so it always matches the current assignment.
+
+That .txt also carries the membrane-test numbers: saving runs the Ra
+analysis on every membrane test in the run and records Ra (both methods),
+Rm, Cm, tau, and how far Ra drifted from the first test to the last.
 
     python cell_metadata_entry.py [--csv path\\to\\cell_metadata.csv] [--abf-dir DIR]
 """
@@ -31,7 +48,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import math
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,24 +59,43 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 DEFAULT_CSV = "cell_metadata.csv"
 
-# (csv/dict key, panel label, expected Clampex protocol, which match to take).
-# "first"/"last" only matters where one protocol fills two slots: the two
-# membrane tests bracket the run, so the earliest DW_Ra is the initial test
-# and the latest is the final one.
+# The run, in the order it is recorded: a membrane test before and after
+# every stimulus protocol.
+#
+#   (csv/dict key, panel label, protocol-name substring, which match to take)
+#
+# The third field is matched as a substring of the header protocol name, not
+# an exact name, so a protocol renamed around its distinguishing part
+# (DW_IC_hyperpol, DW_IC_hyperpol_long, ...) still pairs. The fourth applies
+# only to the stimulus protocols; the membrane tests all share one protocol
+# name and are told apart by position instead (see `auto_assign`).
 PROTOCOL_SLOTS = [
-    ("initial_ra", "Initial membrane test", "DW_Ra", "first"),
-    ("hyperpol", "Hyperpolarizing steps", "DW_hyperpolarizing", "last"),
-    ("depol", "Depolarizing steps", "DW_IC", "last"),
-    ("sepsc", "sEPSCs", "DW_Gap_free_-70_mV", "last"),
-    ("final_ra", "Final membrane test", "DW_Ra", "last"),
+    ("initial_ra", "Membrane test 1", "DW_Ra", "first"),
+    ("depol", "Depolarizing steps", "IC_IV", "last"),
+    ("ra_after_depol", "Membrane test 2", "DW_Ra", "first"),
+    ("hyperpol", "Hyperpolarizing steps", "IC_hyper", "last"),
+    ("ra_after_hyperpol", "Membrane test 3", "DW_Ra", "first"),
+    ("sepsc", "sEPSCs (-70 mV, 2 min)", "DW_Gap_free_-70_mV", "last"),
+    ("final_ra", "Membrane test 4", "DW_Ra", "last"),
 ]
+
+# The membrane-test slots, in run order, each with the stimulus protocol it
+# follows and the one it precedes. A None bound is the start/end of the run.
+RA_WINDOWS = [
+    ("initial_ra", None, "depol"),
+    ("ra_after_depol", "depol", "hyperpol"),
+    ("ra_after_hyperpol", "hyperpol", "sepsc"),
+    ("final_ra", "sepsc", None),
+]
+RA_SLOTS = tuple(key for key, _after, _before in RA_WINDOWS)
+RA_PROTOCOL = "DW_Ra"
 FILE_KEYS = [f"file_{key}" for key, _l, _p, _w in PROTOCOL_SLOTS]
 FIELDNAMES = ["date", "slice", "cell", "rmp_mv", "genotype", "abf_dir"] + FILE_KEYS + ["entered_at"]
 
-# How many of the most recent .abf files to offer. A full run is 5 files;
+# How many of the most recent .abf files to offer. A full run is 7 files;
 # the extra headroom covers re-runs of a protocol and aborted sweeps, and
 # they all stay visible in the dropdowns.
-CANDIDATE_COUNT = 10
+CANDIDATE_COUNT = 14
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +156,217 @@ def as_int(value, default: int = 0) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Per-cell copy folder. Saving the file assignments also gathers that cell's
+# recordings into one folder beside them, next to a plain-text summary -- so
+# a cell can be handed to an analysis script (or to someone else) as a single
+# self-describing directory, without the CSV as a decoder ring.
+# ---------------------------------------------------------------------------
+
+# Characters Windows won't take in a path component, plus anything outside
+# printable ASCII. The RMP is the only free-ish part of the name, so this is
+# belt-and-braces.
+_ILLEGAL_IN_NAME = re.compile(r'[<>:"/\|?*]|[^ -~]')
+
+
+def safe_name(text: str) -> str:
+    """`text` reduced to something Windows will accept as a folder name."""
+    return _ILLEGAL_IN_NAME.sub("-", text).strip(" .") or "unnamed"
+
+
+def rounded_rmp(text: str) -> str:
+    """RMP as a whole number, for use in a name -- ``-70.0`` -> ``-70``.
+
+    Halves round away from zero (-64.5 -> -65), rather than Python's
+    round-half-to-even, so the rounding reads the way it would by hand.
+    Unparseable text is passed through for `safe_name` to deal with.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        return text
+    return str(int(value + (0.5 if value >= 0 else -0.5)))
+
+
+def cell_folder_name(row: dict) -> str:
+    """``yymmdd_s<slice>_c<cell>_<rmp>`` -- e.g. ``260928_s1_c1_-70``."""
+    date = (row.get("date") or "").strip() or "nodate"
+    parts = [date, f"s{as_int(row.get('slice'))}", f"c{as_int(row.get('cell'))}"]
+    rmp = (row.get("rmp_mv") or "").strip()
+    if rmp:
+        parts.append(rounded_rmp(rmp))
+    return safe_name("_".join(parts))
+
+
+def copied_file_name(key: str, source: Path) -> str:
+    """Slot-prefixed copy name, e.g. ``hyperpol_2026_09_28_0010.abf``.
+
+    Prefixed so the folder reads without opening anything, and suffixed with
+    the original name so a copy still points back at the raw recording.
+    """
+    return safe_name(f"{key}_{source.name}")
+
+
+# Units pyabf reports for a recorded current. A membrane test is a
+# voltage-clamp recording; the same analysis run on a current-clamp file
+# finds "steps" in the command anyway and returns a meaningless ~0 MOhm,
+# which in a saved file is worse than no number at all.
+_CURRENT_UNITS = ("a", "ma", "ua", "na", "pa")
+
+
+def clamp_signal_unit(path: Path, channel: int = 0) -> str:
+    """The unit of `path`'s recorded signal -- 'pA' (voltage clamp) or 'mV'
+    (current clamp). Empty if the header can't be read."""
+    try:
+        import pyabf
+        abf = pyabf.ABF(str(path), loadData=False)
+        return (abf.adcUnits[channel] or "").strip()
+    except Exception:                             # noqa: BLE001 -- caller decides
+        return ""
+
+
+def measure_ra(path: Path, method: str = "exact") -> dict:
+    """Membrane-test numbers for one recording, or ``{"error": ...}``.
+
+    Delegates to real_time_ra_analysis so the folder's Ra and the rig's
+    live Ra readout come from the same code. Imported lazily: it pulls in
+    matplotlib, which is far too slow to pay for at form startup.
+
+    Both Ra methods are reported, as they disagree by a lot -- `method`
+    only marks which one is the headline figure.
+    """
+    unit = clamp_signal_unit(path)
+    if unit and unit.lower() not in _CURRENT_UNITS:
+        return {"error": f"not a voltage-clamp recording (signal in {unit})"}
+    try:
+        from real_time_ra_analysis import membrane_test_from_abf, ra_by_both_methods
+    except Exception as exc:                      # noqa: BLE001 -- shown, not raised
+        return {"error": f"analysis unavailable ({exc})"}
+    try:
+        result = membrane_test_from_abf(str(path), method=method)
+        if not any(t.valid for t in result.transients):
+            return {"error": "no valid membrane-test transients"}
+        return {"summary": result.summary(),
+                "ra_both": ra_by_both_methods(result),
+                "method": method}
+    except (Exception, SystemExit) as exc:        # noqa: BLE001 -- ditto
+        return {"error": str(exc) or exc.__class__.__name__}
+
+
+def _mohm(ohm: float) -> str:
+    return "?" if not math.isfinite(ohm) else f"{ohm / 1e6:.1f}"
+
+
+def ra_lines(assignment: dict[str, Path], ra: dict[str, dict]) -> list[str]:
+    """The details file's membrane-test section, in run order."""
+    labels = {key: label for key, label, _p, _w in PROTOCOL_SLOTS}
+    lines = ["membrane tests", "--------------"]
+    for key in RA_SLOTS:
+        label = labels[key]
+        measured = ra.get(key) or {}
+        if key not in assignment:
+            lines.append(f"{label:<24} (not assigned)")
+            continue
+        if "ra_both" not in measured:
+            lines.append(f"{label:<24} not measured -- "
+                         f"{measured.get('error', 'not measured')}")
+            continue
+        both, summary = measured["ra_both"], measured["summary"]
+        exact, quad = both["exact"], both["quadratic"]
+        lines.append(
+            f"{label:<24} Ra {_mohm(exact['mean'])} +/- {_mohm(exact['sd'])} MOhm "
+            f"(exact, n={exact['n']})   quadratic {_mohm(quad['mean'])} MOhm")
+        lines.append(
+            f"{'':<24}   Rm {summary['Rm']['mean']:.1f} MOhm   "
+            f"Cm {summary['Cm']['mean']:.1f} pF   "
+            f"tau {summary['Tau']['mean']:.3f} ms")
+
+    # The drift across the run is the reason the tests bracket every
+    # protocol -- spell it out rather than leaving it as mental arithmetic
+    # between the first and last lines. Measured between the earliest and
+    # latest tests that actually produced a number, so a failed middle test
+    # doesn't cost the comparison.
+    measured = [ra[k]["ra_both"]["exact"]["mean"] for k in RA_SLOTS
+                if "ra_both" in (ra.get(k) or {})]
+    measured = [v for v in measured if math.isfinite(v)]
+    if len(measured) >= 2 and measured[0] > 0:
+        a, b = measured[0], measured[-1]
+        lines.append(f"{'Ra change':<24} {(b - a) / a * 100:+.1f} %   "
+                     f"({_mohm(a)} -> {_mohm(b)} MOhm, exact, "
+                     f"over {len(measured)} tests)")
+    return lines
+
+
+def details_text(row: dict, assignment: dict[str, Path],
+                 protocols: dict[str, str] | None = None,
+                 ra: dict[str, dict] | None = None) -> str:
+    """The per-cell ``.txt``: the CSV row, the copied files, and the Ra of the
+    membrane tests that bracket them."""
+    protocols = protocols or {}
+    ra = ra or {}
+    folder = cell_folder_name(row)
+    lines = [
+        folder,
+        "=" * len(folder),
+        "",
+        f"date          {(row.get('date') or '').strip()}",
+        f"slice         {(row.get('slice') or '').strip()}",
+        f"cell          {(row.get('cell') or '').strip()}",
+        f"RMP (mV)      {(row.get('rmp_mv') or '').strip()}",
+        f"genotype      {(row.get('genotype') or '').strip()}",
+        f"entered at    {(row.get('entered_at') or '').strip()}",
+        f"copied at     {dt.datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "protocol files",
+        "--------------",
+    ]
+    for key, label, _protocol, _which in PROTOCOL_SLOTS:
+        source = assignment.get(key)
+        if source is None:
+            lines.append(f"{label:<24} (not assigned)")
+            continue
+        lines.append(f"{label:<24} {copied_file_name(key, source)}")
+        lines.append(f"{'':<24}   source    {source}")
+        lines.append(f"{'':<24}   protocol  {protocols.get(str(source), '?')}")
+    lines.append("")
+    lines.extend(ra_lines(assignment, ra))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def copy_cell_files(row: dict, assignment: dict[str, Path], dest_root: Path,
+                    protocols: dict[str, str] | None = None,
+                    ra: dict[str, dict] | None = None) -> tuple[Path, list[str]]:
+    """Copy the assigned recordings + details .txt into `dest_root`/<cell>/.
+
+    Returns (folder, errors). Existing copies are overwritten -- re-saving
+    after fixing one slot should leave the folder matching the assignment,
+    not accumulate the earlier mistake. A file that can't be copied is
+    reported rather than raised, so one unreadable recording doesn't cost
+    the other four.
+    """
+    folder = dest_root / cell_folder_name(row)
+    folder.mkdir(parents=True, exist_ok=True)
+    errors: list[str] = []
+    for key, _label, _protocol, _which in PROTOCOL_SLOTS:
+        source = assignment.get(key)
+        if source is None:
+            continue
+        target = folder / copied_file_name(key, source)
+        try:
+            if target.exists() and target.samefile(source):
+                continue
+            shutil.copy2(source, target)
+        except OSError as exc:
+            errors.append(f"{source.name}: {exc}")
+    try:
+        (folder / f"{cell_folder_name(row)}.txt").write_text(
+            details_text(row, assignment, protocols, ra), encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"details .txt: {exc}")
+    return folder, errors
+
+
+# ---------------------------------------------------------------------------
 # ABF candidate scanning + protocol matching (pure functions, so the pairing
 # rules can be exercised without a display or real recordings).
 # ---------------------------------------------------------------------------
@@ -124,9 +374,9 @@ def as_int(value, default: int = 0) -> int:
 def read_abf_protocol(path: Path) -> tuple[str | None, dt.datetime | None]:
     """(protocol name, recording start time) from an .abf header.
 
-    Header-only read (``loadData=False``) -- opening the sweep data of five
-    gap-free recordings just to learn their protocol names would make the
-    scan feel sluggish. Returns (None, mtime) if the file can't be parsed,
+    Header-only read (``loadData=False``) -- opening the sweep data of a
+    run's worth of recordings just to learn their protocol names would make
+    the scan feel sluggish. Returns (None, mtime) if the file can't be parsed,
     so an unreadable file still shows up as a manually assignable candidate.
     """
     try:
@@ -160,22 +410,62 @@ def scan_candidates(folder: Path, limit: int = CANDIDATE_COUNT) -> list[dict]:
     return scanned
 
 
-def auto_assign(candidates: list[dict]) -> dict[str, Path]:
-    """Pair protocol slots with candidate files by header protocol name.
+def _matching_indices(candidates: list[dict], protocol: str) -> list[int]:
+    """Positions in `candidates` whose header protocol contains `protocol`."""
+    return [i for i, c in enumerate(candidates)
+            if protocol.lower() in (c["protocol"] or "").strip().lower()]
 
-    `candidates` is oldest-first, as returned by scan_candidates. Slots with
-    no matching recording are left unassigned rather than filled with a
-    guess -- a wrong-but-plausible pairing is worse than a blank one.
+
+def auto_assign(candidates: list[dict]) -> dict[str, Path]:
+    """Pair protocol slots with candidate files.
+
+    `candidates` is oldest-first, as returned by scan_candidates.
+
+    The three stimulus protocols are found by name (a case-insensitive
+    substring of the header protocol). The four membrane tests cannot be --
+    they are all DW_Ra -- so each is taken from the gap between the stimulus
+    protocols it sits between: the run is Ra, depol, Ra, hyperpol, Ra,
+    sEPSCs, Ra. Within a gap the test nearest its protocol wins, which is
+    what makes a re-run membrane test supersede the one before it.
+
+    Slots with no matching recording are left unassigned rather than filled
+    with a guess -- a wrong-but-plausible pairing is worse than a blank one.
     """
     assigned: dict[str, Path] = {}
+
+    # 1. the stimulus protocols, by name -- these anchor everything else.
+    anchors: dict[str, int] = {}
     for key, _label, protocol, which in PROTOCOL_SLOTS:
-        matches = [c for c in candidates
-                   if (c["protocol"] or "").strip().lower() == protocol.lower()]
-        if not matches:
+        if key in RA_SLOTS:
             continue
-        assigned[key] = (matches[0] if which == "first" else matches[-1])["path"]
-    # A run with only one DW_Ra file has an initial membrane test and no
-    # final one -- don't pair the same file into both slots.
+        hits = _matching_indices(candidates, protocol)
+        if not hits:
+            continue
+        anchors[key] = hits[0] if which == "first" else hits[-1]
+        assigned[key] = candidates[anchors[key]]["path"]
+
+    # 2. the membrane tests, by the gap they fall in.
+    ra = _matching_indices(candidates, RA_PROTOCOL)
+    for key, after, before in RA_WINDOWS:
+        # A test is measured from the protocol it sits against: the first one
+        # from the protocol that follows it, the rest from the one they
+        # follow. Without that anchor there is nothing to measure from, so
+        # the slot stays blank. The opposite bound only narrows the search,
+        # so an aborted run still pairs the tests it did record.
+        if (before if after is None else after) not in anchors:
+            continue
+        lo = anchors.get(after, -1) if after else -1
+        hi = anchors.get(before, len(candidates)) if before else len(candidates)
+        gap = [i for i in ra if lo < i < hi]
+        if not gap:
+            continue
+        # The first test has no protocol before it, so take the one closest
+        # to the protocol that follows; every other is the first test after
+        # the protocol it reports on.
+        assigned[key] = candidates[gap[-1] if after is None else gap[0]]["path"]
+
+    # A run with only one DW_Ra file has a first membrane test and no last
+    # one -- don't pair the same file into both slots.
     if "final_ra" in assigned and assigned.get("initial_ra") == assigned["final_ra"]:
         del assigned["final_ra"]
     return assigned
@@ -309,7 +599,7 @@ class MetadataWindow(QtWidgets.QWidget):
         self.slot_combos: dict[str, QtWidgets.QComboBox] = {}
         for r, (key, label, protocol, _which) in enumerate(PROTOCOL_SLOTS):
             grid.addWidget(QtWidgets.QLabel(label), r, 0)
-            pro_label = QtWidgets.QLabel(f"{protocol}.pro")
+            pro_label = QtWidgets.QLabel(f"*{protocol}*")
             pro_label.setStyleSheet("color: #898781;")
             grid.addWidget(pro_label, r, 1)
 
@@ -598,8 +888,8 @@ class MetadataWindow(QtWidgets.QWidget):
             used[str(path)] = label
 
         # File names are stored bare, with the folder in its own abf_dir
-        # column -- five absolute paths per row makes the CSV unreadable in
-        # Excel. A Browse pick from some other folder keeps its full path, so
+        # column -- seven absolute paths per row makes the CSV unreadable
+        # in Excel. A Browse pick from some other folder keeps its full path, so
         # every entry still resolves without guessing.
         row = self.rows[self.target_row]
         row["abf_dir"] = str(self.abf_dir) if self.abf_dir else ""
@@ -619,10 +909,60 @@ class MetadataWindow(QtWidgets.QWidget):
 
         self._set_table_row(self.target_row, row)
         self._files_dirty = False
+
+        # The CSV row is already safe on disk at this point, so a failure to
+        # gather the copies is reported but doesn't undo the save.
+        copied_to = self._copy_cell_folder(row, assignment)
+
+        where = self.csv_path.name if copied_to is None else f"{self.csv_path.name} + {copied_to.name}\\"
         self.status.setText(
             f"Saved {len(assignment)}/{len(PROTOCOL_SLOTS)} protocol file(s) for "
-            f"{self._target_label()}  ->  {self.csv_path.name}"
+            f"{self._target_label()}  ->  {where}"
         )
+
+    def _copy_cell_folder(self, row: dict, assignment: dict[str, Path]) -> Path | None:
+        """Gather this cell's recordings + details .txt under the ABF folder.
+
+        Returns the folder, or None if nothing was copied. Needs the ABF
+        folder: a Browse-only assignment with no folder chosen has nowhere
+        obvious to put the copies, so it just skips them.
+        """
+        if not assignment or not self.abf_dir or not self.abf_dir.is_dir():
+            return None
+        protocols = {str(c["path"]): (c["protocol"] or "?") for c in self.candidates}
+        ra = self._measure_membrane_tests(assignment)
+        try:
+            folder, errors = copy_cell_files(row, assignment, self.abf_dir,
+                                             protocols, ra)
+        except OSError as exc:
+            self._warn(f"Saved the CSV row, but could not create the cell folder:\n{exc}")
+            return None
+        if errors:
+            self._warn("Saved the CSV row, but some files did not copy:\n\n"
+                       + "\n".join(errors))
+        return folder
+
+    def _measure_membrane_tests(self, assignment: dict[str, Path]) -> dict[str, dict]:
+        """Run the membrane-test analysis on every assigned membrane test.
+
+        A couple of hundred milliseconds each, so it runs inline -- but it
+        still blocks the form, hence the wait cursor and the status line.
+        A recording that won't analyse records its error in the details
+        file instead of stopping the save.
+        """
+        measured: dict[str, dict] = {}
+        slots = [k for k in RA_SLOTS if k in assignment]
+        if not slots:
+            return measured
+        self.status.setText("Measuring Ra...")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            for key in slots:
+                measured[key] = measure_ra(assignment[key])
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        return measured
 
     # -- shutdown ------------------------------------------------------
     def closeEvent(self, event) -> None:
