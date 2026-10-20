@@ -783,15 +783,25 @@ def _grab_keyboard_focus(fig) -> None:
     quit key. If 'q' is dead too the window is not receiving the keyboard at
     all (a focus problem, out here); if 'q' works and space does not, the
     binding itself is at fault.
+
+    The window is also pinned always-on-top. Windows' foreground lock can
+    leave a merely raised window behind the console or Clampex; a topmost
+    window stays above every ordinary window regardless of who owns focus.
     """
     win = getattr(getattr(fig.canvas, "manager", None), "window", None)
     if win is not None:
         try:                                 # Qt
-            win.show()
+            try:
+                from matplotlib.backends.qt_compat import QtCore
+                win.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+            except Exception:                # noqa: BLE001 - best effort only
+                pass
+            win.show()                       # required after changing flags
             win.raise_()
             win.activateWindow()
         except AttributeError:
             try:                             # Tk
+                win.attributes("-topmost", True)
                 win.lift()
                 win.focus_force()
             except Exception:                # noqa: BLE001 - best effort only
