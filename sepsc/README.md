@@ -43,8 +43,23 @@ python -m sepsc.<module> [args...]         # equivalent, direct module invocatio
 ## Environment
 
 - The project's main virtualenv (`.venv`) has everything except TensorFlow.
-- **`detect.py` (miniML) needs TensorFlow**, which lives in a **separate `clampex_miniml`
-  conda environment**, not the main venv. Run it with that interpreter explicitly:
+- **`detect.py` needs both TensorFlow and the `miniml` package**, which live in a
+  **separate `clampex_miniml` conda environment**, not the main venv. Build it with:
+  ```
+  conda create -n clampex_miniml python=3.11
+  conda activate clampex_miniml
+  pip install git+https://github.com/delvendahl/miniML.git
+  pip install pyabf
+  ```
+  Install miniML *first* — it pins `tensorflow==2.15.1` (keep that pin; `detect` loads
+  the legacy-format `GC_lstm_model.h5`, and TF 2.16+ switches to Keras 3) and pulls the
+  rest of the scientific stack with it. Installing TensorFlow first and letting miniML
+  downgrade it corrupts the install on Windows; see the root
+  [README](../README.md#setup) for the symptom and the fix.
+  Note also that `pip install miniml` from PyPI is an unrelated package, and that
+  pip needs `git` on the Windows `PATH` to resolve the `git+https://` URL.
+
+  Run it with that interpreter explicitly:
   ```
   <path-to-anaconda3>\envs\clampex_miniml\python.exe -m sepsc detect recording.abf
   ```

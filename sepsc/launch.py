@@ -10,9 +10,10 @@ that method is invoked with --no-gui).
 
 `detect` (miniML) needs the separate 'clampex_miniml' conda environment
 (TensorFlow isn't in this project's main venv, see sepsc.detect) -- this
-picker auto-detects that environment as a sibling of the current conda
-root's envs/ folder, and falls back to asking you to locate its python.exe
-if that guess is wrong.
+picker auto-detects that environment under the envs/ folder of the conda
+root behind the running interpreter (whether that's a conda env directly or
+a venv created from one), and falls back to asking you to locate its
+python.exe if that guess is wrong.
 
 `fastmini` always applies its own fixed 3 kHz Bessel + 10 kHz resample
 first (that 10 kHz convention is baked into its fixed-sample-count analysis
@@ -81,15 +82,22 @@ METHOD_CHOICES = [
 
 
 def _find_clampex_miniml_python() -> Optional[str]:
-    """Sibling-env guess: this project's main interpreter is normally either
-    a conda base env or itself an env under <conda_root>/envs/, so
-    clampex_miniml should be a sibling under the same envs/ folder either
-    way. Returns None if neither guess exists (caller should ask the user)."""
-    candidates = [
-        os.path.join(sys.prefix, "envs", "clampex_miniml", "python.exe"),
-        os.path.join(os.path.dirname(os.path.dirname(sys.prefix)), "envs", "clampex_miniml", "python.exe"),
-    ]
-    for candidate in candidates:
+    """Sibling-env guess: clampex_miniml lives under <conda_root>/envs/, so
+    locate a conda root from the running interpreter and look there.
+
+    Both sys.prefix and sys.base_prefix are tried, because the documented
+    setup runs this from a plain `python -m venv .venv` whose prefix is the
+    project folder, not a conda root -- only base_prefix still points at the
+    conda install the venv was created from. Each is checked as a conda root
+    itself (base env) and as an env under one (<root>/envs/<name>).
+    Returns None if no guess exists (caller should ask the user)."""
+    roots = []
+    for prefix in (sys.prefix, sys.base_prefix):
+        for root in (prefix, os.path.dirname(os.path.dirname(prefix))):
+            if root not in roots:
+                roots.append(root)
+    for root in roots:
+        candidate = os.path.join(root, "envs", "clampex_miniml", "python.exe")
         if os.path.exists(candidate):
             return candidate
     return None

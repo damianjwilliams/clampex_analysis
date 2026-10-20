@@ -22,8 +22,30 @@ Requires Python 3.11+ on Windows.
    ```
    conda create -n clampex_miniml python=3.11
    conda activate clampex_miniml
-   pip install tensorflow pyabf numpy pandas matplotlib scipy scikit-learn
+   pip install git+https://github.com/delvendahl/miniML.git
+   pip install pyabf
    ```
+   **Install miniML first, before TensorFlow.** miniML pins `tensorflow==2.15.1` and
+   pulls in numpy/pandas/scipy/matplotlib/scikit-learn itself, so this one command gets
+   the whole stack at versions that agree. Don't fight the 2.15 pin: `detect` loads the
+   bundled legacy-format `GC_lstm_model.h5`, and TensorFlow 2.16+ switches to Keras 3
+   (upstream ships a separate `GC_model_keras3.keras` for that case).
+
+   Two gotchas on Windows:
+   - `pip install miniml` (plain, from PyPI) installs an **unrelated placeholder
+     package** — you must install from the GitHub URL above.
+   - pip shells out to `git` for a `git+https://` URL, so `git` has to be on the
+     Windows `PATH` (e.g. `C:\Program Files\Git\cmd`), not just inside Git Bash.
+
+   If you install TensorFlow *first* and let miniML downgrade it, pip leaves an
+   orphaned `site-packages\tensorflow\` directory with no `__init__.py`, and every
+   import then fails with `No module named 'tensorflow.compat'`. To recover:
+   ```
+   pip uninstall -y tensorflow tensorflow-intel
+   rmdir /s /q <env>\Lib\site-packages\tensorflow    # if still present
+   pip install tensorflow==2.15.1
+   ```
+
    Run `detect` with that interpreter explicitly:
    ```
    <path-to-anaconda3>\envs\clampex_miniml\python.exe -m sepsc detect recording.abf
