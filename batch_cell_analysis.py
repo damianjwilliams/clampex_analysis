@@ -110,6 +110,11 @@ of birth gives each cell an ``age_days`` (its folder's date minus the DOB),
 so cells from different litters stay distinguishable once the summaries are
 pooled.
 
+The details are also saved to ``run_metadata.txt`` in the experiment folder,
+one ``key: value`` per line. Running on that folder again starts from them:
+the dialog fills its fields in from the file, and a run without the dialog
+takes any detail not given as a flag from it.
+
 The animal is identified by three fields rather than one because no single
 one of them is reliable on its own: a mouse number is only unique within its
 cage, a cage number changes when animals are moved, and the ID markers (ear
@@ -132,7 +137,10 @@ against QC guides -- Ra and Cm shown before and after the recordings, joined
 by a line, so a cell that ran down is obvious -- and each cell's traces at
 rheobase, at half its maximum firing rate, and at the maximum.
 ``--no-window`` skips it; ``--view`` reopens it later for a folder that has
-already been analysed, without re-running anything.
+already been analysed, without re-running anything. Each tab is also saved as
+a PNG in the experiment folder (``qc_f_i_curves.png``, ``qc_cell_health.png``,
+``qc_traces.png`` and, when there are sEPSCs, ``qc_sepscs.png``) -- whenever
+the window opens, and at the end of a ``--no-window`` run unless ``--no-plot``.
 
 Usage
 -----
@@ -214,6 +222,43 @@ def age_days(dob: str, folder_date: str) -> Optional[int]:
     return (recorded - born).days
 
 
+# The run details, as a plain-text file in the experiment folder: one
+# "key: value" per line, so it can be read -- and corrected -- in any editor.
+# It is what the next run on the same folder starts from, and unlike the
+# summary CSV it survives the summary being deleted or regenerated.
+RUN_METADATA_FILE = "run_metadata.txt"
+RUN_DETAIL_KEYS = ["brain_region", "cell_type", "mouse_number", "cage_number",
+                   "id_markers", "genotype", "strain", "animal_sex", "animal_dob"]
+
+
+def read_run_metadata(root: Path) -> Optional[dict]:
+    """The run details saved in `root`, or None if there is no file. Keys it
+    does not know are ignored, and keys it is missing come back blank."""
+    path = Path(root) / RUN_METADATA_FILE
+    if not path.is_file():
+        return None
+    details = {k: "" for k in RUN_DETAIL_KEYS}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() in details:
+            details[key.strip()] = value.strip()
+    return details
+
+
+def write_run_metadata(root: Path, details: dict) -> Path:
+    path = Path(root) / RUN_METADATA_FILE
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"# Run details for this folder, written by batch_cell_analysis.py on {stamp}.",
+             "# The next run on this folder starts from these values; edit them here",
+             "# or in the run dialog. Dates are YYYY-MM-DD; a blank value is unknown.",
+             ""]
+    lines += [f"{k}: {details.get(k, '') or ''}" for k in RUN_DETAIL_KEYS]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def find_cell_folders(root: Path, include_unparsed: bool = False) -> list[tuple[Path, dict]]:
     """(folder, metadata) for every cell folder under `root`, sorted by name.
 
@@ -240,6 +285,25 @@ def find_cell_folders(root: Path, include_unparsed: bool = False) -> list[tuple[
         found.append((folder, meta))
     found.sort(key=lambda fm: str(fm[0]).lower())
     return found
+
+
+def skipped_cell_folders(root: Path) -> list[tuple[Path, str]]:
+    """(folder, reason) for every folder under `root` that looks like it was
+    meant to be a cell but `find_cell_folders` passes over: it holds .abf
+    files under a name that does not parse, or it is named like a cell and
+    holds none. A mistyped name otherwise just silently drops a cell."""
+    skipped: list[tuple[Path, str]] = []
+    for folder in sorted(p for p in root.rglob("*") if p.is_dir()):
+        try:
+            has_abf = any(p.suffix.lower() == ".abf" for p in folder.iterdir() if p.is_file())
+        except OSError:
+            continue
+        named = parse_cell_folder(folder.name) is not None
+        if has_abf and not named:
+            skipped.append((folder, "name does not match YYMMDD_s<slice>_c<cell>_<RMP>"))
+        elif named and not has_abf:
+            skipped.append((folder, "no .abf files in it"))
+    return skipped
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +812,7 @@ def analyze_membrane_test(path: Path, opts) -> tuple[dict, list[str]]:
     written = []
     txt = mt.default_report_path(str(path))
     mt.write_report(res, txt, settings={"method": "exact", "t1": 0.20,
-                                        "fit": "10-80% of peak", "min_r2": 0.80})
+                                        "fit": "20-80% of peak", "min_r2": 0.80})
     written.append(str(txt))
     if not opts.no_plot and res.first_sweep:
         fs = res.first_sweep
@@ -1028,6 +1092,18 @@ def show_qc_window(root: Path, summary: "Optional[pd.DataFrame]" = None) -> bool
         return False
 
 
+def save_qc_images(root: Path, summary: "Optional[pd.DataFrame]" = None) -> bool:
+    """The QC window's tabs as PNGs in `root`, without opening it. Never fatal,
+    for the same reason as show_qc_window."""
+    try:
+        import batch_qc_window
+        batch_qc_window.save_qc_images(root, summary)
+        return True
+    except Exception as exc:
+        print(f"NOTE: could not save the QC images ({exc}).", file=sys.stderr)
+        return False
+
+
 def pick_root_folder() -> Optional[str]:
     from tkinter import Tk, filedialog
     root = Tk()
@@ -1241,6 +1317,7 @@ def main(argv=None) -> int:
     # details in one step; --no-gui (or a missing PyQt5) falls back to a plain
     # folder picker, leaving those columns to the flags above.
     root: Optional[Path] = Path(args.root) if args.root else None
+    used_dialog = False
     if (root is None or args.gui) and not args.no_gui:
         try:
             import batch_run_dialog
@@ -1254,6 +1331,7 @@ def main(argv=None) -> int:
                 return 1
             root = Path(chosen.pop("root"))
             args.run_details.update(chosen)
+            used_dialog = True
     if root is None:
         picked = pick_root_folder()
         if not picked:
@@ -1261,6 +1339,18 @@ def main(argv=None) -> int:
         root = Path(picked)
     if not root.is_dir():
         p.error(f"not a folder: {root}")
+
+    # The dialog already started from the folder's saved details, so what it
+    # returned is final. A run without it takes each detail from its flag, or
+    # from the saved file where the flag was left blank.
+    saved = read_run_metadata(root)
+    if saved and not used_dialog:
+        filled = [k for k, v in saved.items() if v and not args.run_details.get(k)]
+        for k in filled:
+            args.run_details[k] = saved[k]
+        if filled:
+            print(f"Run details not given as flags taken from {RUN_METADATA_FILE}: "
+                  f"{', '.join(filled)}")
 
     if args.view:
         return 0 if show_qc_window(root) else 1
@@ -1273,7 +1363,12 @@ def main(argv=None) -> int:
               f"named folders anyway).", file=sys.stderr)
         return 1
 
-    print(f"{len(cells)} cell folder(s) under {root}\n")
+    # Written before the analysis, so the details are kept even if it fails.
+    meta_path = write_run_metadata(root, args.run_details)
+    print(f"{len(cells)} cell folder(s) under {root}\nRun details  ->  {meta_path}\n")
+    if not args.include_unparsed:
+        for folder, reason in skipped_cell_folders(root):
+            print(f"SKIPPED {folder.relative_to(root)}: {reason}")
     rows = []
     for n, (folder, meta) in enumerate(cells, 1):
         print(f"[{n}/{len(cells)}] {folder.name}")
@@ -1288,8 +1383,12 @@ def main(argv=None) -> int:
 
     # The table in memory, not the CSV just written: identical content, but it
     # means a run whose summary landed somewhere else via --out still opens.
+    # The window saves its tabs as PNGs in the root as it opens; without it
+    # they are saved anyway, unless --no-plot asked for no figures at all.
     if not args.no_window:
         show_qc_window(root, df)
+    elif not args.no_plot:
+        save_qc_images(root, df)
     return 0
 
 
