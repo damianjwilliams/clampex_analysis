@@ -10,7 +10,10 @@ departs from a healthy one soonest.
 Access resistance and capacitance are shown twice per cell -- from the
 membrane test before the step recordings and the one after -- joined by a
 line, so a cell that ran down during the recording reads as a slope rather
-than as a single number that happens to look acceptable.
+than as a single number that happens to look acceptable. The Access
+resistance tab follows Ra through the whole run, one point per membrane test
+with the protocol each pair sandwiches between them:
+Ra - AP steps - Ra - hyperpolarizing steps - Ra - sEPSC - Ra.
 
 Opened automatically at the end of a ``batch_cell_analysis.py`` run, and
 available on its own for a folder that has already been analysed:
@@ -209,6 +212,18 @@ def _flagged(summary: pd.DataFrame) -> dict[str, list[str]]:
             if np.isfinite(d) and abs(d) > RA_DRIFT_PCT:
                 flag(row, f"Ra drifted {d:+.0f}%")
 
+    # The same guide per protocol: a cell can be stable across the steps and
+    # still lose access during the sEPSC recording.
+    from batch_cell_analysis import RA_SANDWICH
+    for key, label in RA_SANDWICH:
+        col = f"ra_{key}_change_pct"
+        if col not in summary:
+            continue
+        for _i, row in summary.iterrows():
+            d = _num(row, col)
+            if np.isfinite(d) and abs(d) > RA_DRIFT_PCT:
+                flag(row, f"Ra {d:+.0f}% across {label}")
+
     for _i, row in summary.iterrows():
         snr = _num(row, "sepsc_snr")
         if np.isfinite(snr) and snr < SEPSC_MIN_SNR:
@@ -240,6 +255,7 @@ class QCWindow(QtWidgets.QMainWindow):
         self.figures: dict[str, Figure] = {
             "F-I curves": self._fi_figure(),
             "Cell health": self._health_figure(),
+            "Access resistance": self._ra_figure(),
             "Traces": self._traces_figure(),
         }
         # Only when something was actually detected: a batch of current-clamp
@@ -428,6 +444,92 @@ class QCWindow(QtWidgets.QMainWindow):
         fig.suptitle("Cell health across the batch   (red = trips a QC guide; "
                      "guides are conventions, editable in batch_qc_window.py)",
                      fontsize=10)
+        return fig
+
+    # -- Access resistance: Ra either side of every protocol ----------
+    def _ra_figure(self) -> Figure:
+        """Each cell's Ra at every membrane test, in run order.
+
+        Membrane test k+1 sits at x = k; protocol k is drawn between x = k
+        and x = k+1 as a line from its before Ra to its after Ra, so a full
+        run reads as one connected line. A protocol that was not recorded
+        leaves its span empty, bridged by a dotted line when the tests either
+        side of it are one and the same recording. A change across one
+        protocol of more than RA_DRIFT_PCT is drawn thick, with the % in red.
+        """
+        from batch_cell_analysis import RA_SANDWICH
+        fig = Figure(figsize=(12, 7.2), tight_layout=True)
+        ax = fig.add_subplot(1, 1, 1)
+        n = len(RA_SANDWICH)
+
+        def text(col, i):
+            if col not in self.summary:
+                return ""
+            v = self.summary[col].iloc[i]
+            return "" if pd.isna(v) else str(v)
+
+        any_drawn = False
+        for i, name in enumerate(self.names):
+            color = self.colors[name]
+            points: dict[float, float] = {}
+            last_after: Optional[tuple[str, float, int]] = None   # (file, Ra, x)
+            for k, (key, _label) in enumerate(RA_SANDWICH):
+                a = self._column(f"ra_{key}_before_MOhm").iloc[i]
+                b = self._column(f"ra_{key}_after_MOhm").iloc[i]
+                d = self._column(f"ra_{key}_change_pct").iloc[i]
+                fa = text(f"ra_{key}_before_file", i)
+                if (last_after and fa and fa == last_after[0] and last_after[2] < k
+                        and np.isfinite(a)):
+                    # same membrane test either side of a protocol not recorded
+                    ax.plot([last_after[2], k], [a, a], ":", color=color, lw=1.2,
+                            alpha=0.8, zorder=1)
+                if np.isfinite(a) and np.isfinite(b):
+                    big = bool(np.isfinite(d) and abs(d) > RA_DRIFT_PCT)
+                    ax.plot([k, k + 1], [a, b], "-", color=color,
+                            lw=3.6 if big else 1.4, alpha=0.85, zorder=2)
+                    if big:
+                        ax.annotate(f"{d:+.0f}%", (k + 0.5, (a + b) / 2),
+                                    textcoords="offset points", xytext=(0, 7),
+                                    ha="center", fontsize=8, color="#d62728",
+                                    fontweight="bold")
+                if np.isfinite(a):
+                    points[k] = a
+                if np.isfinite(b):
+                    points[k + 1] = b
+                fb = text(f"ra_{key}_after_file", i)
+                if fb and np.isfinite(b):
+                    last_after = (fb, b, k + 1)
+            for x, v in points.items():
+                ax.plot([x], [v], "o", ms=7, color=color, zorder=3)
+                ax.annotate(f"{v:.1f}", (x, v), textcoords="offset points",
+                            xytext=(6, 0), ha="left", va="center", fontsize=7)
+            if points:
+                any_drawn = True
+                ax.plot([], [], "-o", color=color, ms=5, label=_short(name))
+        ra_guide = next((g[4] for g in QC_GUIDES if g[0] == "mt_Ra_MOhm"), None)
+        if ra_guide is not None:
+            ax.axhline(ra_guide, color="#d62728", ls="--", lw=1.0, alpha=0.8,
+                       label=f"QC guide {ra_guide:g} MOhm")
+        # membrane tests on the ticks, the protocols in the spans between them
+        ax.set_xticks(range(n + 1))
+        ax.set_xticklabels([f"Ra {k + 1}" for k in range(n + 1)], fontsize=9)
+        for k, (_key, label) in enumerate(RA_SANDWICH):
+            ax.annotate(label, (k + 0.5, 0), xycoords=("data", "axes fraction"),
+                        xytext=(0, 6), textcoords="offset points", ha="center",
+                        fontsize=9, color="#555555", style="italic")
+            ax.axvspan(k + 0.08, k + 0.92, color="#888888", alpha=0.05, zorder=0)
+        ax.set_xlim(-0.3, n + 0.5)
+        ax.set_ylabel("Access resistance (MOhm)")
+        ax.margins(y=0.15)
+        ax.grid(axis="y", alpha=0.25)
+        if any_drawn:
+            ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+        else:
+            ax.text(0.5, 0.5, "No membrane tests either side of a protocol",
+                    transform=ax.transAxes, ha="center", va="center")
+        ax.set_title("Ra either side of each protocol\n(thick line, red % = changed by "
+                     f"more than {RA_DRIFT_PCT:g}% across that protocol;  dotted = "
+                     "same membrane test, protocol not recorded)", fontsize=10)
         return fig
 
     # -- tab 4: sEPSCs --------------------------------------------------

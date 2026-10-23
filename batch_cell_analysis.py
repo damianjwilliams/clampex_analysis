@@ -452,6 +452,42 @@ def pick_membrane_tests(scanned: list[dict], targets: list[Optional[Path]],
     return pre, post, notes
 
 
+# The protocols each sandwiched between two membrane tests, in run order:
+# Ra - AP steps - Ra - hyperpolarizing steps - Ra - sEPSC - Ra.
+# (column key, label used in the summary and the QC window)
+RA_SANDWICH = [
+    ("steps", "AP steps"),
+    ("hyperpol", "Hyperpol steps"),
+    ("sepsc", "sEPSC"),
+]
+
+
+def pick_ra_sandwich(scanned: list[dict], protocols: dict[str, Optional[Path]],
+                     protocol: str = "DW_Ra",
+                     ) -> dict[str, tuple[Optional[Path], Optional[Path]]]:
+    """For each protocol recording, the membrane tests either side of it.
+
+    `protocols` maps an RA_SANDWICH key to its recording (None if absent).
+    The Ra before a protocol is the last membrane test recorded before it, the
+    Ra after is the first one recorded after it -- by header time, so with the
+    full run each Ra in the middle is the "after" of one protocol and the
+    "before" of the next, exactly as it was recorded. A protocol with no
+    timestamp, or no membrane test on one side, gets None there.
+    """
+    cands, _notes = membrane_test_candidates(scanned, protocol)
+    when = {c["path"]: c["when"] for c in scanned}
+    out: dict[str, tuple[Optional[Path], Optional[Path]]] = {}
+    for key, path in protocols.items():
+        t = when.get(path) if path is not None else None
+        if t is None:
+            out[key] = (None, None)
+            continue
+        before = [c["path"] for c in cands if c["when"] and c["when"] < t]
+        after = [c["path"] for c in cands if c["when"] and c["when"] > t]
+        out[key] = (before[-1] if before else None, after[0] if after else None)
+    return out
+
+
 def pick_sepsc_file(scanned: list[dict], protocol: str = "gap_free",
                     ) -> tuple[Optional[Path], list[str]]:
     """(the sEPSC recording, notes).
@@ -985,6 +1021,13 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
         scanned, getattr(opts, "protocol_sepsc", "gap_free"))
     notes += sepsc_notes
 
+    # Hyperpolarizing sweeps that live in the step file are not a protocol of
+    # their own, so have no Ra sandwich of their own either.
+    sandwiched = {"steps": steps_path,
+                  "hyperpol": hyper_path if hyper_path != steps_path else None,
+                  "sepsc": sepsc_path}
+    sandwich = pick_ra_sandwich(scanned, sandwiched, opts.protocol_ra)
+
     row["file_membrane_test"] = ra_pre.name if ra_pre else ""
     row["file_membrane_test_post"] = ra_post.name if ra_post else ""
     row["file_steps"] = steps_path.name if steps_path else ""
@@ -992,12 +1035,26 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
     row["file_sepsc"] = sepsc_path.name if sepsc_path else ""
     used = {p for p in (ra_pre, ra_post, steps_path, hyper_path, sepsc_path)
             if p is not None}
+    used |= {p for pair in sandwich.values() for p in pair if p is not None}
     row["files_unused"] = ";".join(c["path"].name for c in scanned if c["path"] not in used)
 
+    # A membrane test is usually the "after" of one protocol and the "before"
+    # of the next; measure each one once, however many slots it fills.
+    ra_cache: dict[Path, tuple[dict, list[str]]] = {}
+
+    def mt_cached(path: Path, opts) -> tuple[dict, list[str]]:
+        if path not in ra_cache:
+            ra_cache[path] = analyze_membrane_test(path, opts)
+        return ra_cache[path]
+
+    def mt_post_cached(path: Path, opts) -> tuple[dict, list[str]]:
+        out, written = mt_cached(path, opts)
+        return {f"mt_post_{k[len('mt_'):]}": v for k, v in out.items()}, written
+
     stages = [
-        ("Ra before", ra_pre, analyze_membrane_test,
+        ("Ra before", ra_pre, mt_cached,
          f"no {opts.protocol_ra} (or any voltage-clamp) recording before the steps"),
-        ("Ra after", ra_post, analyze_membrane_test_post,
+        ("Ra after", ra_post, mt_post_cached,
          f"no {opts.protocol_ra} recording after the steps"),
         ("sag / Rin", hyper_path, analyze_subthreshold,
          "no hyperpolarizing sweeps in this folder"),
@@ -1025,8 +1082,59 @@ def analyze_cell(folder: Path, meta: dict, opts) -> dict:
                 traceback.print_exc()
 
     row.update(ra_drift(row))
+    row.update(ra_sandwich_columns(sandwich, sandwiched, mt_cached, opts, notes, scanned))
+    if row.get("ra_sequence"):
+        print(f"    {'Ra sequence':<15} {row['ra_sequence']}")
     row["notes"] = " | ".join(notes)
     return row
+
+
+def ra_sandwich_columns(sandwich: dict, protocols: dict[str, Optional[Path]],
+                        measure, opts, notes: list[str], scanned: list[dict]) -> dict:
+    """The Ra either side of each protocol, its change, and the run as text.
+
+    ``ra_<key>_before_MOhm`` / ``ra_<key>_after_MOhm`` (and the file each came
+    from) per RA_SANDWICH protocol, ``ra_<key>_change_pct`` across it, and
+    ``ra_sequence`` -- e.g. ``Ra 10.2 > AP steps > Ra 11.0 > Hyperpol steps >
+    Ra 12.3 > sEPSC > Ra 14.1`` -- in the order the files were recorded. A
+    missing side is left blank and noted, never filled from another test.
+    """
+    out: dict = {}
+    ra_of: dict[Path, float] = {}
+
+    def ra(path: Path) -> float:
+        if path not in ra_of:
+            try:
+                ra_of[path] = _as_float(measure(path, opts)[0].get("mt_Ra_MOhm"))
+            except (Exception, SystemExit) as exc:
+                notes.append(f"Ra failed on {path.name}: {exc}")
+                ra_of[path] = float("nan")
+        return ra_of[path]
+
+    timeline: dict[Path, str] = {}
+    for key, label in RA_SANDWICH:
+        before, after = sandwich.get(key, (None, None))
+        proto = protocols.get(key)
+        if proto is not None:
+            timeline[proto] = label
+            for side, path in (("before", before), ("after", after)):
+                if path is None:
+                    notes.append(f"no Ra {side} {label}")
+        for side, path in (("before", before), ("after", after)):
+            out[f"ra_{key}_{side}_file"] = path.name if path else ""
+            out[f"ra_{key}_{side}_MOhm"] = ra(path) if path else float("nan")
+            if path is not None:
+                v = out[f"ra_{key}_{side}_MOhm"]
+                timeline[path] = f"Ra {v:.1f}" if np.isfinite(v) else "Ra ?"
+        a, b = out[f"ra_{key}_before_MOhm"], out[f"ra_{key}_after_MOhm"]
+        out[f"ra_{key}_change_pct"] = (100.0 * (b - a) / a
+                                       if np.isfinite(a) and np.isfinite(b) and a
+                                       else float("nan"))
+
+    when = {c["path"]: c["when"] for c in scanned}
+    order = sorted(timeline, key=lambda p: (when.get(p) is None, when.get(p) or 0))
+    out["ra_sequence"] = " > ".join(timeline[p] for p in order)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1048,6 +1156,14 @@ COLUMN_ORDER = [
     "mt_post_Ra_MOhm", "mt_post_Ra_sd", "mt_post_Rm_MOhm", "mt_post_Rt_MOhm",
     "mt_post_Cm_pF", "mt_post_Cm_sd", "mt_post_tau_ms", "mt_post_Iss_pA",
     "mt_post_n_transients", "mt_Ra_change_MOhm", "mt_Ra_change_pct",
+    # the Ra either side of each protocol: Ra > AP steps > Ra > hyperpol > Ra > sEPSC > Ra
+    "ra_sequence",
+    "ra_steps_before_MOhm", "ra_steps_after_MOhm", "ra_steps_change_pct",
+    "ra_hyperpol_before_MOhm", "ra_hyperpol_after_MOhm", "ra_hyperpol_change_pct",
+    "ra_sepsc_before_MOhm", "ra_sepsc_after_MOhm", "ra_sepsc_change_pct",
+    "ra_steps_before_file", "ra_steps_after_file",
+    "ra_hyperpol_before_file", "ra_hyperpol_after_file",
+    "ra_sepsc_before_file", "ra_sepsc_after_file",
     # subthreshold current clamp
     "Vrest_measured_mV", "bias_current_pA", "bias_current_sd_pA", "sag_target_mV", "sag_ratio", "sag_amplitude_mV",
     "sag_v_peak_mV", "sag_stim_pA", "sag_bracketed", "sag_n_sweeps", "sag_note",
