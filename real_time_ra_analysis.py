@@ -133,6 +133,12 @@ class TransientResult:
     fit_intercept: float = np.nan
     fit_sign: float = 1.0
     fit_t0: float = np.nan          # time origin of the fit (s)
+    # --- two-exponential fit, extrapolated back to the edge (see _fit_biexp) ---
+    Ra_biexp: float = np.nan        # Ohm, dV / (I(edge) - I2)
+    tau_fast: float = np.nan        # s
+    tau_slow: float = np.nan        # s
+    frac_slow: float = np.nan       # slow share of the amplitude at the edge
+    biexp: Optional[dict] = None    # fit parameters, for the diagnostic plot
 
 
 @dataclass
@@ -245,6 +251,84 @@ def _fit_tau_log(t: np.ndarray, y: np.ndarray, lo_frac: float, hi_frac: float):
                 intercept=float(intercept),
                 lo=float(lo), hi=float(hi))
     return tau, r2, info
+
+
+def _fit_biexp(t: np.ndarray, y: np.ndarray, peak_i: int,
+               skip_s: float = 50e-6, tau_guess: float = np.nan):
+    """
+    Two-exponential fit to a transient, extrapolated back to the command edge.
+
+    `y` is the transient relative to its own steady state, sign-flipped so it
+    decays from +peak to 0 (as in _fit_tau_log), and t[0] is the edge. Most
+    cells decay with a fast component (charging the soma through Ra) and a
+    slow one (charge spreading into dendrites / coupled cells), which a single
+    exponential can only average over. The fit starts `skip_s` after the peak,
+    past the brief pipette-capacitance / settling excess at the top of the
+    decay, and runs to the end of the step.
+
+    Returns dict(a_fast, a_slow, tau_fast, tau_slow, i0) with amplitudes taken
+    AT THE EDGE (A) and i0 = a_fast + a_slow, or None if scipy is missing or
+    the fit fails.
+    """
+    try:
+        from scipy.optimize import curve_fit
+    except ImportError:
+        return None
+    dt = float(t[1] - t[0])
+    s0 = peak_i + int(round(skip_s / dt))
+    if y.size - s0 < 20:
+        return None
+
+    # fit in ms and pA so the optimiser's step sizes are sensible
+    tt = (t[s0:] - t[s0]) * 1e3
+    yy = y[s0:] * 1e12
+    tg = tau_guess * 1e3 if np.isfinite(tau_guess) and tau_guess > 0 else 0.5
+
+    def bi(x, a1, t1, a2, t2):
+        return a1 * np.exp(-x / t1) + a2 * np.exp(-x / t2)
+
+    try:
+        p, _ = curve_fit(bi, tt, yy, p0=[0.7 * yy[0], 0.6 * tg, 0.3 * yy[0], 3 * tg],
+                         bounds=([0, 0.005, 0, 0.005], [np.inf, 50, np.inf, 50]),
+                         maxfev=20000)
+    except Exception:                        # noqa: BLE001 - no fit, no number
+        return None
+    a1, t1, a2, t2 = p
+    if t1 > t2:
+        a1, t1, a2, t2 = a2, t2, a1, t1
+    back = (t[s0] - t[0]) * 1e3              # ms from the edge to the fit start
+    a1, a2 = a1 * np.exp(back / t1) * 1e-12, a2 * np.exp(back / t2) * 1e-12
+    if not np.isfinite(a1 + a2) or a1 + a2 <= 0:
+        return None
+    return dict(a_fast=float(a1), a_slow=float(a2), tau_fast=float(t1 * 1e-3),
+                tau_slow=float(t2 * 1e-3), i0=float(a1 + a2), fit_i0=int(s0))
+
+
+def biexp_summary(result) -> dict:
+    """Mean/SD of the two-exponential Ra (Ohm) and medians of its components.
+
+    Uses the same transients as ra_by_both_methods (those not rejected before
+    any Ra solve), so the header's numbers all describe the same events.
+    """
+    trs = [tr for tr in result.transients
+           if not tr.note.startswith("rejected") and np.isfinite(tr.Ra_biexp)]
+    ra = np.array([tr.Ra_biexp for tr in trs], float)
+    med = lambda a: float(np.median([getattr(tr, a) for tr in trs])) if trs else float("nan")
+    return {"mean": float(ra.mean()) if ra.size else float("nan"),
+            "sd": float(ra.std()) if ra.size else float("nan"),
+            "n": int(ra.size), "tau_fast": med("tau_fast"),
+            "tau_slow": med("tau_slow"), "frac_slow": med("frac_slow")}
+
+
+def format_biexp(d: dict, tau_symbol="tau", mu="u") -> str:
+    """One line for the two-exponential Ra, shared by the figure and console."""
+    if not np.isfinite(d["mean"]):
+        return "Ra (2-exp, extrapolated to step): no fit"
+    return (f"Ra (2-exp, extrapolated to step): {d['mean']/1e6:.1f} ± "
+            f"{d['sd']/1e6:.1f} MΩ (n={d['n']})      "
+            f"{tau_symbol}fast {d['tau_fast']*1e6:.0f} {mu}s,  "
+            f"{tau_symbol}slow {d['tau_slow']*1e3:.2f} ms,  "
+            f"slow {d['frac_slow']*100:.0f}% of amplitude")
 
 
 def _solve_ra_quadratic(Rt: float, tau: float, Cm: float,
@@ -470,6 +554,20 @@ def membrane_test_from_arrays(
                 Cm = Cm_charge * Rt / Rm if Rm > 0 else float("nan")
                 valid = bool(np.isfinite(Cm) and Cm > 0)
 
+        # two-exponential Ra: Ohm's law at the edge, I(edge) from the fit
+        bx = None
+        Ra_bx = tf = tsl = fsl = float("nan")
+        if finfo:
+            bx = _fit_biexp(t_seg, amp * finfo["sign"], finfo["peak_i"],
+                            tau_guess=tau)
+        if bx:
+            Id = finfo["sign"] * bx["i0"] + dI          # I(edge) - I2
+            Ra_bx = dV / Id if Id != 0 else float("nan")
+            if not (0 < Ra_bx < Rt):
+                Ra_bx = float("nan")
+            tf, tsl = bx["tau_fast"], bx["tau_slow"]
+            fsl = bx["a_slow"] / bx["i0"]
+
         result.transients.append(TransientResult(
             edge_index=int(edge_idx), direction=direction,
             dV=dV, dI=dI, Rt=Rt, Ra=Ra, Rm=Rm,
@@ -486,6 +584,8 @@ def membrane_test_from_arrays(
             fit_intercept=finfo["intercept"] if finfo else np.nan,
             fit_sign=finfo["sign"] if finfo else 1.0,
             fit_t0=finfo["t0"] if finfo else np.nan,
+            Ra_biexp=Ra_bx, tau_fast=tf, tau_slow=tsl, frac_slow=fsl,
+            biexp=dict(bx, sign=finfo["sign"]) if bx else None,
         ))
 
     return result
@@ -836,6 +936,8 @@ def plot_membrane_test(time_s, current_A, command_V, result,
              peak method (magenta)    -- Iprev level, the peak-method fit
                extrapolated back to the edge, the recovered Ipeak marker, and
                the Id = Ipeak-Iprev gap that gives Ra = dV/Id.
+             two-exponential fit (teal) -- started 50 us after the peak and
+               extrapolated back to the edge, where I(edge) gives Ra = dV/Id.
            Pass `cross_records` (from cross_check_peak) to draw the magenta
            overlay; without it only the tau/charge geometry is shown.
     Row 2  the same transient on log axes. A single exponential is a straight
@@ -860,8 +962,10 @@ def plot_membrane_test(time_s, current_A, command_V, result,
     # beside it makes the size of the disagreement (and a quadratic that has
     # no root at all) visible at a glance instead of needing a second run.
     fig.suptitle(format_ra_both(ra_by_both_methods(result), method=method,
-                                tau_symbol="$\\tau$"),
-                 y=0.985, va="top", fontsize=11, fontweight="bold")
+                                tau_symbol="$\\tau$") + "\n"
+                 + format_biexp(biexp_summary(result), tau_symbol="$\\tau$",
+                                mu="$\\mu$"),
+                 y=0.995, va="top", fontsize=11, fontweight="bold")
 
     # ---- row 0: whole sweep, showing WHERE each measurement is taken --------
     axv = fig.add_subplot(gs[0, :])
@@ -927,6 +1031,21 @@ def plot_membrane_test(time_s, current_A, command_V, result,
             ax.plot(tms[tr.peak_idx], ipA[tr.peak_idx], "v", color="red", ms=7,
                     zorder=6, label=f"peak ({(tr.peak_idx-ts)*dt*1e3:.0f} $\\mu$s)")
 
+        # ---- two-exponential fit (teal), extrapolated back to the edge -------
+        bx = tr.biexp
+        if bx:
+            tb = time_s[ts:hi_i] - time_s[ts]
+            yb = (bx["sign"] * (bx["a_fast"] * np.exp(-tb / bx["tau_fast"])
+                                + bx["a_slow"] * np.exp(-tb / bx["tau_slow"]))
+                  ) * 1e12 + I1p
+            ax.plot(tms[ts:hi_i], yb, color="#008080", lw=1.3, ls="--", zorder=5,
+                    label="2-exp fit (extrap. to edge)")
+            ax.plot(tms[ts], yb[0], "s", color="#008080", ms=6, zorder=7,
+                    label=f"I(edge) = {yb[0]:.0f} pA")
+            f0b = min(bx["fit_i0"] + ts, hi_i - 1)
+            ax.axvline(tms[f0b], color="#008080", lw=0.8, ls=":", zorder=3,
+                       label="2-exp fit start")
+
         # ---- peak-method overlay (magenta), if a cross-check was supplied ----
         crec = None
         if cross_records:
@@ -991,6 +1110,16 @@ def plot_membrane_test(time_s, current_A, command_V, result,
                          label=f"single-exp fit ($r^2$={tr.r2_fit:.4f})")
             axl.axvspan(tt[f0 - ts], tt[f1 - ts], color="red", alpha=0.07,
                         label="fit window")
+        if bx:
+            tb = time_s[ts:te] - time_s[ts]
+            for yv, ls, lab in (
+                    (bx["a_fast"] * np.exp(-tb / bx["tau_fast"])
+                     + bx["a_slow"] * np.exp(-tb / bx["tau_slow"]), "--", "2-exp fit"),
+                    (bx["a_fast"] * np.exp(-tb / bx["tau_fast"]), ":",
+                     f"fast $\\tau$ = {bx['tau_fast']*1e6:.0f} $\\mu$s"),
+                    (bx["a_slow"] * np.exp(-tb / bx["tau_slow"]), "-.",
+                     f"slow $\\tau$ = {bx['tau_slow']*1e3:.2f} ms")):
+                axl.semilogy(tt, yv * 1e12, color="#008080", lw=1.1, ls=ls, label=lab)
         pos = amp[m]
         if pos.size:
             axl.set_ylim(max(pos.max() * 2e-3, 0.3), pos.max() * 2.2)
@@ -1004,6 +1133,9 @@ def plot_membrane_test(time_s, current_A, command_V, result,
                f"Rm = {tr.Rm/1e6:.1f} M$\\Omega$\n"
                f"Cm = {tr.Cm*1e12:.0f} pF\nCm(charge) = {tr.Cm_charge*1e12:.0f} pF"
                ) if tr.valid else f"REJECTED:\n{tr.note}"
+        if np.isfinite(tr.Ra_biexp):
+            txt += (f"\nRa(2-exp) = {tr.Ra_biexp/1e6:.1f} M$\\Omega$  "
+                    f"(slow {tr.frac_slow*100:.0f}%)")
         if crec is not None and crec.get("plot_fit"):
             txt += f"\nRa(peak) = {crec['plot_fit']['Ra']/1e6:.1f} M$\\Omega$"
         axl.annotate(txt, (0.02, 0.03), xycoords="axes fraction", ha="left",
@@ -1251,6 +1383,7 @@ def main(argv=None):
     # Also on the console: the QC window can be closed, off-screen or never
     # opened, and this is the one place both Ra answers are guaranteed to land.
     print(format_ra_both(ra_by_both_methods(res), method=args.method))
+    print(format_biexp(biexp_summary(res)))
 
     if args.cross_check:
         import pyabf
