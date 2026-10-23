@@ -236,14 +236,19 @@ class QCWindow(QtWidgets.QMainWindow):
         self.flags = _flagged(self.summary)
 
         self.setWindowTitle(f"Recording QC  -  {run['root']}")
-        tabs = QtWidgets.QTabWidget()
-        tabs.addTab(self._wrap(self._fi_figure()), "F-I curves")
-        tabs.addTab(self._wrap(self._health_figure()), "Cell health")
-        tabs.addTab(self._traces_tab(), "Traces")
+        # Kept, by tab title, so save_figures() can write exactly what is shown.
+        self.figures: dict[str, Figure] = {
+            "F-I curves": self._fi_figure(),
+            "Cell health": self._health_figure(),
+            "Traces": self._traces_figure(),
+        }
         # Only when something was actually detected: a batch of current-clamp
         # recordings has no gap-free files and should not get an empty tab.
         if run.get("sepsc_events") or run.get("sepsc_waves"):
-            tabs.addTab(self._wrap(self._sepsc_figure()), "sEPSCs")
+            self.figures["sEPSCs"] = self._sepsc_figure()
+        tabs = QtWidgets.QTabWidget()
+        for title, fig in self.figures.items():
+            tabs.addTab(self._traces_tab(fig) if title == "Traces" else self._wrap(fig), title)
         self.setCentralWidget(tabs)
 
         n_flagged = len(self.flags)
@@ -262,6 +267,18 @@ class QCWindow(QtWidgets.QMainWindow):
         avail = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1250, 820)
         self.resize(min(1250, int(avail.width() * 0.95)),
                     min(860, int(avail.height() * 0.92)))
+
+    def save_figures(self, folder: Path, dpi: int = 150) -> list[Path]:
+        """Every tab's figure as a PNG in `folder`, e.g. qc_cell_health.png.
+        Saved from the figure itself rather than grabbed off the screen, so the
+        Traces tab comes out whole instead of as much of it as fits the window."""
+        paths = []
+        for title, fig in self.figures.items():
+            slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+            path = Path(folder) / f"qc_{slug}.png"
+            fig.savefig(path, dpi=dpi)
+            paths.append(path)
+        return paths
 
     def _wrap(self, fig: Figure) -> QtWidgets.QWidget:
         """A figure plus the matplotlib toolbar, so anything can be zoomed and
@@ -588,8 +605,7 @@ class QCWindow(QtWidgets.QMainWindow):
             ax.legend(fontsize=7, loc="best", framealpha=0.9)
 
     # -- tab 3: traces --------------------------------------------------
-    def _traces_tab(self) -> QtWidgets.QWidget:
-        fig = self._traces_figure()
+    def _traces_tab(self, fig: Figure) -> QtWidgets.QWidget:
         page = self._wrap(fig)
         # One row per cell, so the figure grows past the window: scroll it
         # rather than squeezing ten cells into 800 px.
@@ -668,13 +684,32 @@ class QCWindow(QtWidgets.QMainWindow):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+def _report_saved(paths: list[Path]) -> None:
+    if paths:
+        print(f"QC images  ->  {', '.join(p.name for p in paths)}  in  {paths[0].parent}")
+
+
+def save_qc_images(root: Path, summary: Optional[pd.DataFrame] = None) -> list[Path]:
+    """Write every QC tab as a PNG in `root` without showing the window."""
+    run = load_run(Path(root), summary)
+    qt_app()
+    win = QCWindow(run)
+    paths = win.save_figures(Path(root))
+    win.deleteLater()
+    _report_saved(paths)
+    return paths
+
+
 def show_qc_window(root: Path, summary: Optional[pd.DataFrame] = None,
-                   block: bool = True) -> Optional[QCWindow]:
-    """Open the QC window for a finished run. Blocks until it is closed when
-    `block`, so a command-line run ends when the user is done looking."""
+                   block: bool = True, save: bool = True) -> Optional[QCWindow]:
+    """Open the QC window for a finished run, first saving its tabs as PNGs in
+    `root` when `save`. Blocks until it is closed when `block`, so a
+    command-line run ends when the user is done looking."""
     run = load_run(Path(root), summary)
     app = qt_app()
     win = QCWindow(run)
+    if save:
+        _report_saved(win.save_figures(Path(root)))
     win.show()
     win.raise_()
     win.activateWindow()

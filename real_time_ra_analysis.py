@@ -21,7 +21,7 @@ Both edges of every pulse (both capacitive transients) are used. For each edge:
   * Rt  = dV / dI                      = Ra + Rm      (total resistance)
   * Iss = (I1 + I2) / 2                (steady-state current)
   * Tau is found from a fast log-linear fit of the decaying transient,
-    fit between the "proportion of peak" ordinates (default 10-80%).
+    fit between the "proportion of peak" ordinates (default 20-80%).
   * Q1  = integral of (I(t) - I1) over the transient          (charge above I1)
   * Q2  = dI * Tau                     (settling-time correction)
   * Qt  = Q1 + Q2
@@ -63,7 +63,7 @@ reported in convenient units (mV, pA, ms, MOhm, pF).
 Usage
 -----
     python membrane_test.py recording.abf
-    python membrane_test.py recording.abf --channel 0 --sweeps 0-4 --fit 10 80
+    python membrane_test.py recording.abf --channel 0 --sweeps 0-4 --fit 20 80
     python membrane_test.py --selftest        # run synthetic RC validation
 
 Requires: numpy, scipy, and (for reading ABFs) pyabf.
@@ -359,7 +359,7 @@ def membrane_test_from_arrays(
     current_A: np.ndarray,
     command_V: np.ndarray,
     t1_fraction: float = 0.20,
-    fit_lo: float = 0.10,
+    fit_lo: float = 0.20,
     fit_hi: float = 0.80,
     min_step_V: Optional[float] = None,
     min_r2: float = 0.80,
@@ -372,7 +372,7 @@ def membrane_test_from_arrays(
     ----------
     time_s, current_A, command_V : 1-D arrays of equal length (SI units).
     t1_fraction : fraction of each step, at its end, used to measure steady state.
-    fit_lo, fit_hi : proportion-of-peak ordinates for the tau fit (e.g. 0.10, 0.80).
+    fit_lo, fit_hi : proportion-of-peak ordinates for the tau fit (e.g. 0.20, 0.80).
     min_step_V : command-step threshold for edge detection; auto if None.
     min_r2 : minimum log-fit r^2 to accept a transient.
     method : 'exact' (default, Ra = tau/Cm_charge) or 'quadratic' (the
@@ -817,7 +817,7 @@ def _grab_keyboard_focus(fig) -> None:
 
 def plot_membrane_test(time_s, current_A, command_V, result,
                        out_path="membrane_test_qc.png", title="",
-                       max_edges=2, fit_lo=0.10, fit_hi=0.80,
+                       max_edges=2, fit_lo=0.20, fit_hi=0.80,
                        cross_records=None, show=False, method=None):
     """
     Draw a QC figure so every measurement can be checked by eye.
@@ -832,7 +832,7 @@ def plot_membrane_test(time_s, current_A, command_V, result,
            transient), plus the command trace beneath.
     Row 1  per transient, zoomed to the decay. Two methods are drawn together:
              tau/charge method (red)  -- I1/Iss levels, the shaded Q1 area, the
-               10-80%-of-peak ordinates, and the red single-exponential fit;
+               20-80%-of-peak ordinates, and the red single-exponential fit;
              peak method (magenta)    -- Iprev level, the peak-method fit
                extrapolated back to the edge, the recovered Ipeak marker, and
                the Id = Ipeak-Iprev gap that gives Ra = dV/Id.
@@ -1178,9 +1178,9 @@ def main(argv=None):
     p.add_argument("--t1", type=float, default=0.20,
                    help="Steady-state window as fraction of a step (default 0.20)")
     p.add_argument("--fit", type=float, nargs=2, metavar=("LO", "HI"),
-                   default=(10.0, 80.0),
+                   default=(20.0, 80.0),
                    help="Proportion-of-peak %% ordinates for the tau fit "
-                        "(default 10 80)")
+                        "(default 20 80)")
     p.add_argument("--method", choices=("exact", "quadratic"), default="exact",
                    help="'exact' = Ra=tau/Cm_charge (default); 'quadratic' = the "
                         "published Newton-Raphson root (biased, fails if Ra>Rt/4)")

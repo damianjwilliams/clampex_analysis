@@ -71,6 +71,7 @@ Requires Python 3.11+ on Windows.
 | `batch_cell_analysis.py` | Batch driver: one folder per cell (`YYMMDD_s<slice>_c<cell>_<RMP>`), one summary row per cell — membrane test, sag / input resistance, and AP features |
 | `batch_run_dialog.py` | PyQt5 dialog the batch driver opens when given no folder: picks the experiment folder and records the animal (DOB, sex, genotype, strain) |
 | `batch_qc_window.py` | QC window shown when a batch finishes: F-I curves overlaid, cell-health measurements against QC guides, and the traces behind them |
+| `compare_sepsc_groups.py` | Compares sEPSC frequency/amplitude between groups (e.g. genotype) across batch runs, using one amplitude cutoff above every cell's detection limit so recordings with different noise are compared fairly |
 | `calculate_Ra.py` | Access resistance / membrane resistance / capacitance / tau from a voltage-clamp "Membrane Test" recording |
 | `check_sta_data.py` | Quick averaging utility for `.sta` spike-triggered-average files |
 | `membrane_test.ipynb`, `membrane_test_whole_trace.ipynb` | Notebook versions of the membrane-test calculation, for interactive exploration |
@@ -98,6 +99,9 @@ animal it came from — date of birth, sex, genotype, strain — and reports how
 cell folders it found before anything runs. Those go into every summary row, and
 the DOB gives each cell an `age_days` from its folder's recording date. The same
 fields are flags (`--dob`, `--sex`, `--genotype`, `--strain`) for scripted runs.
+They are also saved to `run_metadata.txt` in the experiment folder, a plain
+`key: value` text file; running on that folder again fills the dialog in from it
+(or, without the dialog, uses it for any detail not given as a flag).
 
 When the run finishes a QC window opens, with every cell's F-I curve overlaid on
 one axes, the cell-health measurements (Ra, Cm, resting Vm, rheobase, AP
