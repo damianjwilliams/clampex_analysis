@@ -148,6 +148,7 @@ class TransientResult:
 class MembraneTestResult:
     transients: list[TransientResult] = field(default_factory=list)
     first_sweep: dict = field(default_factory=dict)  # arrays kept for plotting
+    n_sweeps: int = 0                                # sweeps pooled
 
     def _agg(self, attr, direction=None):
         vals = [getattr(t, attr) for t in self.transients
@@ -324,11 +325,11 @@ def biexp_summary(result) -> dict:
 
 
 def format_biexp(d: dict, tau_symbol="tau", mu="u") -> str:
-    """One line for the two-exponential Ra, shared by the figure and console."""
+    """One plain-ASCII console line for the two-exponential Ra."""
     if not np.isfinite(d["mean"]):
         return "Ra (2-exp, extrapolated to step): no fit"
-    return (f"Ra (2-exp, extrapolated to step): {d['mean']/1e6:.1f} ± "
-            f"{d['sd']/1e6:.1f} MΩ (n={d['n']})      "
+    return (f"Ra (2-exp, extrapolated to step): {d['mean']/1e6:.1f} +/- "
+            f"{d['sd']/1e6:.1f} MOhm (n={d['n']})      "
             f"{tau_symbol}fast {d['tau_fast']*1e6:.0f} {mu}s,  "
             f"{tau_symbol}slow {d['tau_slow']*1e3:.2f} ms,  "
             f"slow {d['frac_slow']*100:.0f}% of amplitude")
@@ -371,11 +372,11 @@ def fit1090_summary(result) -> dict:
 
 
 def format_1090(d: dict, tau_symbol="tau") -> str:
-    """One line for the 10-90% Ra, shared by the figure and console."""
+    """One plain-ASCII console line for the 10-90% Ra."""
     if not np.isfinite(d["mean"]):
         return f"Ra (exact, {tau_symbol} fit 10-90%): no valid fit"
-    return (f"Ra (exact, {tau_symbol} fit 10-90%): {d['mean']/1e6:.1f} ± "
-            f"{d['sd']/1e6:.1f} MΩ (n={d['n']})      "
+    return (f"Ra (exact, {tau_symbol} fit 10-90%): {d['mean']/1e6:.1f} +/- "
+            f"{d['sd']/1e6:.1f} MOhm (n={d['n']})      "
             f"{tau_symbol} {d['tau']*1e3:.3f} ms")
 
 
@@ -543,8 +544,8 @@ def ra_by_both_methods(result) -> dict:
 def format_ra_both(ra_both: dict, method=None, tau_symbol="tau") -> str:
     """One line naming both Ra results, marking `method` as the reported one.
 
-    Shared by the figure header and the console so the two cannot drift; the
-    figure passes a mathtext tau, the console the plain word.
+    Plain ASCII for the console (a cp1252 Windows console cannot print
+    an Ohm sign); the QC figure tabulates the same numbers itself.
     """
     def one(key, label):
         d = ra_both[key]
@@ -553,11 +554,11 @@ def format_ra_both(ra_both: dict, method=None, tau_symbol="tau") -> str:
                    else "no valid transients")
             body = why
         else:
-            body = f"{d['mean']/1e6:.1f} ± {d['sd']/1e6:.1f} MΩ (n={d['n']})"
-        tag = "  ← reported" if method == key else ""
+            body = f"{d['mean']/1e6:.1f} +/- {d['sd']/1e6:.1f} MOhm (n={d['n']})"
+        tag = "  <- reported" if method == key else ""
         return f"{label}: {body}{tag}"
 
-    return (f"Ra  —  {one('exact', f'exact ({tau_symbol}/Cm_charge)')}"
+    return (f"Ra  -  {one('exact', f'exact ({tau_symbol}/Cm_charge)')}"
             f"        {one('quadratic', 'quadratic (MD note)')}")
 
 
@@ -932,6 +933,7 @@ def membrane_test_from_abf(
             first = dict(time_s=t, current_A=i, command_V=c, result=res)
         pooled.transients.extend(res.transients)
     pooled.first_sweep = first
+    pooled.n_sweeps = len(sweep_list)
 
     if not pooled.transients:
         print("WARNING: no command steps detected. Is this a Membrane-Test "
@@ -1044,9 +1046,18 @@ def _grab_keyboard_focus(fig) -> None:
 def plot_membrane_test(time_s, current_A, command_V, result,
                        out_path="membrane_test_qc.png", title="",
                        max_edges=2, fit_lo=0.20, fit_hi=0.80,
-                       cross_records=None, show=False, method=None):
+                       cross_records=None, show=False, method=None,
+                       table_result=None, table_cross_records=None,
+                       table_label=None):
     """
     Draw a QC figure so every measurement can be checked by eye.
+
+    The header table of Ra by every method is computed from `table_result`
+    (and `table_cross_records` for the peak-method row) when given -- pass the
+    whole-file result so the table matches the console summary rather than
+    the one plotted trace. `table_label` is printed above it to say which
+    sweeps the numbers cover. Without them the table falls back to `result`
+    and `cross_records`, i.e. only the plotted trace.
 
     If `show` is True an interactive window is opened (blocking until you close
     it, or press the space bar); if `out_path` is given the figure is also
@@ -1087,9 +1098,16 @@ def plot_membrane_test(time_s, current_A, command_V, result,
     # The reported numbers come from one method only; tabulating the others
     # beside it makes the size of the disagreement (and a quadratic that has
     # no root at all) visible at a glance instead of needing a second run.
-    _draw_ra_table(fig.add_axes([0.04, 0.835, 0.92, 0.155]),
-                   ra_table_rows(result, method=method, fit_lo=fit_lo,
-                                 fit_hi=fit_hi, cross_records=cross_records))
+    if table_result is None:
+        table_result, table_cross_records = result, cross_records
+        table_label = table_label or "Ra from the plotted trace only"
+    tax = fig.add_axes([0.04, 0.835, 0.92, 0.135])
+    _draw_ra_table(tax, ra_table_rows(table_result, method=method,
+                                      fit_lo=fit_lo, fit_hi=fit_hi,
+                                      cross_records=table_cross_records))
+    if table_label:
+        fig.text(0.5, 0.993, table_label, ha="center", va="top",
+                 fontsize=11, fontweight="bold")
 
     # ---- row 0: whole sweep, showing WHERE each measurement is taken --------
     axv = fig.add_subplot(gs[0, :])
@@ -1369,6 +1387,36 @@ def _parse_sweeps(spec: str) -> list[int]:
 
 
 
+def _load_trace(args, abf, sweeps, sweep=None):
+    """(t, i, c) in SI units for one sweep, or the average over `sweeps` when
+    `sweep` is None."""
+    if sweep is None:
+        ys = []
+        for sw in sweeps:
+            abf.setSweep(sw, channel=args.channel)
+            ys.append(np.asarray(abf.sweepY, float))
+        y, sweep = np.mean(ys, axis=0), sweeps[0]
+    else:
+        abf.setSweep(sweep, channel=args.channel)
+        y = np.asarray(abf.sweepY, float)
+    abf.setSweep(sweep, channel=args.channel)
+    t = _to_si(np.asarray(abf.sweepX, float), "s")
+    i = _to_si(y, abf.sweepUnitsY)
+    if args.command_channel is not None:
+        abf.setSweep(sweep, channel=args.command_channel)
+        c = _to_si(np.asarray(abf.sweepY, float), abf.sweepUnitsY)
+    else:
+        c = _to_si(np.asarray(abf.sweepC, float), abf.sweepUnitsC)
+    return t, i, c
+
+
+def _table_label(res) -> str:
+    """Caption for the QC table when it shows the whole-file result."""
+    n = sum(tr.valid for tr in res.transients)
+    return (f"Ra over all {res.n_sweeps} sweeps ({n} valid transients) "
+            f"- same numbers as the console summary")
+
+
 def _make_plot(args, res):
     """Build the QC figure for the CLI, optionally on the sweep-average trace."""
     import pyabf
@@ -1379,44 +1427,30 @@ def _make_plot(args, res):
     sweeps = _parse_sweeps(args.sweeps) if args.sweeps else list(range(abf.sweepCount))
 
     if args.plot_average:
-        ys = []
-        for sw in sweeps:
-            abf.setSweep(sw, channel=args.channel)
-            ys.append(np.asarray(abf.sweepY, float))
-        y = np.mean(ys, axis=0)
-        abf.setSweep(sweeps[0], channel=args.channel)
-        t = _to_si(np.asarray(abf.sweepX, float), "s")
-        i = _to_si(y, abf.sweepUnitsY)
-        if args.command_channel is not None:
-            abf.setSweep(sweeps[0], channel=args.command_channel)
-            c = _to_si(np.asarray(abf.sweepY, float), abf.sweepUnitsY)
-        else:
-            c = _to_si(np.asarray(abf.sweepC, float), abf.sweepUnitsC)
-        r = membrane_test_from_arrays(t, i, c, **kw)
+        t, i, c = _load_trace(args, abf, sweeps)
         title = f"{args.abf}  -  average of {len(sweeps)} sweeps"
     else:
         sw = args.plot_sweep if args.plot_sweep is not None else sweeps[0]
-        abf.setSweep(sw, channel=args.channel)
-        t = _to_si(np.asarray(abf.sweepX, float), "s")
-        i = _to_si(np.asarray(abf.sweepY, float), abf.sweepUnitsY)
-        if args.command_channel is not None:
-            abf.setSweep(sw, channel=args.command_channel)
-            c = _to_si(np.asarray(abf.sweepY, float), abf.sweepUnitsY)
-        else:
-            c = _to_si(np.asarray(abf.sweepC, float), abf.sweepUnitsC)
-        r = membrane_test_from_arrays(t, i, c, **kw)
+        t, i, c = _load_trace(args, abf, sweeps, sweep=sw)
         title = f"{args.abf}  -  sweep {sw}"
+    r = membrane_test_from_arrays(t, i, c, **kw)
 
     # peak-method overlay: draw it on the same trace whenever --cross-check is on
-    cross = None
+    cross = table_cross = None
     if getattr(args, "cross_check", False):
-        cross = cross_check_peak(t, i, c, skips_ms=tuple(args.cross_check_skips),
-                                 t1_fraction=args.t1)
+        skips = tuple(args.cross_check_skips)
+        cross = cross_check_peak(t, i, c, skips_ms=skips, t1_fraction=args.t1)
+        # the table's peak row uses the sweep average, as the console does
+        table_cross = (cross if args.plot_average else
+                       cross_check_peak(*_load_trace(args, abf, sweeps),
+                                        skips_ms=skips, t1_fraction=args.t1))
 
     out = plot_membrane_test(t, i, c, r, out_path=args.plot, title=title,
                              fit_lo=kw["fit_lo"], fit_hi=kw["fit_hi"],
                              cross_records=cross, show=args.show,
-                             method=kw["method"])
+                             method=kw["method"], table_result=res,
+                             table_cross_records=table_cross,
+                             table_label=_table_label(res))
     if out:
         print(f"QC figure written to {out}")
     if args.show:
@@ -1470,6 +1504,11 @@ def main(argv=None):
     p.add_argument("--selftest", action="store_true",
                    help="Run the synthetic validation and exit")
     args = p.parse_args(argv)
+    # The console lines are plain ASCII, but a legacy Windows code page
+    # (cp1252) must never turn a stray symbol into a crash that loses the
+    # summary: replace what it cannot encode instead.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
 
     if args.selftest:
         _selftest()
@@ -1518,18 +1557,7 @@ def main(argv=None):
         sweeps = (_parse_sweeps(args.sweeps) if args.sweeps
                   else list(range(abf.sweepCount)))
         # average across sweeps for the cleanest fit, mirroring --plot-average
-        ys = []
-        for sw in sweeps:
-            abf.setSweep(sw, channel=args.channel)
-            ys.append(np.asarray(abf.sweepY, float))
-        abf.setSweep(sweeps[0], channel=args.channel)
-        t = _to_si(np.asarray(abf.sweepX, float), "s")
-        i = _to_si(np.mean(ys, axis=0), abf.sweepUnitsY)
-        if args.command_channel is not None:
-            abf.setSweep(sweeps[0], channel=args.command_channel)
-            c = _to_si(np.asarray(abf.sweepY, float), abf.sweepUnitsY)
-        else:
-            c = _to_si(np.asarray(abf.sweepC, float), abf.sweepUnitsC)
+        t, i, c = _load_trace(args, abf, sweeps)
         recs = cross_check_peak(t, i, c, skips_ms=tuple(args.cross_check_skips),
                                 t1_fraction=args.t1)
         main_ra = res.summary()["Ra"]["mean"]
