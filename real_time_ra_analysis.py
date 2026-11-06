@@ -139,6 +139,9 @@ class TransientResult:
     tau_slow: float = np.nan        # s
     frac_slow: float = np.nan       # slow share of the amplitude at the edge
     biexp: Optional[dict] = None    # fit parameters, for the diagnostic plot
+    # --- exact Ra re-solved from a 10-90% single-exponential fit (see _ra_1090) ---
+    Ra_1090: float = np.nan         # Ohm
+    tau_1090: float = np.nan        # s
 
 
 @dataclass
@@ -329,6 +332,126 @@ def format_biexp(d: dict, tau_symbol="tau", mu="u") -> str:
             f"{tau_symbol}fast {d['tau_fast']*1e6:.0f} {mu}s,  "
             f"{tau_symbol}slow {d['tau_slow']*1e3:.2f} ms,  "
             f"slow {d['frac_slow']*100:.0f}% of amplitude")
+
+
+# Proportion-of-peak window for the alternative tau fit. The main fit uses the
+# --fit window (default 20-80%); this one always spans 10-90%, so it reaches
+# further into both the fast early decay and the slow tail.
+FIT_1090 = (0.10, 0.90)
+
+
+def _ra_1090(t_seg, amp, dV, dI, Q1, Rt, min_r2):
+    """Exact Ra (tau/Cm_charge) with tau fitted over 10-90% of the peak.
+
+    Q2 = dI*tau depends on tau, so Cm_charge is recomputed from this fit
+    rather than borrowed from the main one. Returns (Ra, tau); Ra is NaN when
+    the fit fails, its r^2 is below `min_r2`, or the result is non-physical.
+    """
+    tau, r2, _ = _fit_tau_log(t_seg, amp, *FIT_1090)
+    if not (np.isfinite(tau) and np.isfinite(r2) and r2 >= min_r2):
+        return float("nan"), float("nan")
+    Cm_charge = (Q1 + dI * tau) / dV
+    if not (np.isfinite(Cm_charge) and Cm_charge > 0 and Rt > 0):
+        return float("nan"), tau
+    Ra, ok = _solve_ra_exact(Rt, tau, Cm_charge)
+    return (Ra if ok else float("nan")), tau
+
+
+def fit1090_summary(result) -> dict:
+    """Mean/SD of the 10-90% Ra (Ohm) and its median tau, over the same
+    transients as ra_by_both_methods."""
+    trs = [tr for tr in result.transients
+           if not tr.note.startswith("rejected") and np.isfinite(tr.Ra_1090)]
+    ra = np.array([tr.Ra_1090 for tr in trs], float)
+    return {"mean": float(ra.mean()) if ra.size else float("nan"),
+            "sd": float(ra.std()) if ra.size else float("nan"),
+            "n": int(ra.size),
+            "tau": float(np.median([tr.tau_1090 for tr in trs])) if trs
+                   else float("nan")}
+
+
+def format_1090(d: dict, tau_symbol="tau") -> str:
+    """One line for the 10-90% Ra, shared by the figure and console."""
+    if not np.isfinite(d["mean"]):
+        return f"Ra (exact, {tau_symbol} fit 10-90%): no valid fit"
+    return (f"Ra (exact, {tau_symbol} fit 10-90%): {d['mean']/1e6:.1f} ± "
+            f"{d['sd']/1e6:.1f} MΩ (n={d['n']})      "
+            f"{tau_symbol} {d['tau']*1e3:.3f} ms")
+
+
+def ra_table_rows(result, method=None, fit_lo=0.20, fit_hi=0.80,
+                  cross_records=None) -> list[dict]:
+    """One row per Ra method for the QC figure's header table.
+
+    Each row is dict(method, ra, n, note, reported); `ra` is (mean, sd) in
+    MOhm or a string explaining why there is no value.
+    """
+    def val(d):
+        return ((d["mean"] / 1e6, d["sd"] / 1e6) if np.isfinite(d["mean"])
+                else None)
+
+    both = ra_by_both_methods(result)
+    lo, hi = round(fit_lo * 100), round(fit_hi * 100)
+    rows = [
+        dict(method=f"Exact  τ / Cm_charge  (τ fit {lo}–{hi}%)",
+             ra=val(both["exact"]) or "no valid transients",
+             n=both["exact"]["n"], note="",
+             reported=method in (None, "exact")),
+    ]
+    d = fit1090_summary(result)
+    rows.append(dict(method="Exact  τ / Cm_charge  (τ fit 10–90%)",
+                     ra=val(d) or "no valid fit", n=d["n"],
+                     note=f"τ {d['tau']*1e3:.3f} ms" if np.isfinite(d["tau"])
+                          else "", reported=False))
+    rows.append(dict(method="Quadratic  (MD note)",
+                     ra=val(both["quadratic"]) or "no real root (Ra > Rt/4)",
+                     n=both["quadratic"]["n"], note="",
+                     reported=method == "quadratic"))
+    d = biexp_summary(result)
+    rows.append(dict(method="2-exp, extrapolated to step",
+                     ra=val(d) or "no fit", n=d["n"],
+                     note=(f"τfast {d['tau_fast']*1e6:.0f} µs,  "
+                           f"τslow {d['tau_slow']*1e3:.2f} ms,  "
+                           f"slow {d['frac_slow']*100:.0f}%")
+                          if np.isfinite(d["mean"]) else "",
+                     reported=False))
+    if cross_records:
+        pk = np.array([r["Ra_plateau"] for r in cross_records
+                       if np.isfinite(r["Ra_plateau"])], float)
+        rows.append(dict(method="Peak method  (cross-check, plateau)",
+                         ra=(pk.mean() / 1e6, pk.std() / 1e6) if pk.size
+                            else "no plateau",
+                         n=int(pk.size), note="averaged sweep, per edge",
+                         reported=False))
+    return rows
+
+
+def _draw_ra_table(ax, rows) -> None:
+    """Render ra_table_rows() as a table, highlighting the reported row."""
+    ax.axis("off")
+    cells = []
+    for r in rows:
+        ra = (f"{r['ra'][0]:.1f} ± {r['ra'][1]:.1f}" if isinstance(r["ra"], tuple)
+              else r["ra"])
+        name = r["method"] + ("   ← reported" if r["reported"] else "")
+        cells.append([name, ra, str(r["n"]) if r["n"] else "–", r["note"]])
+    tbl = ax.table(cellText=cells,
+                   colLabels=["Ra method", "Ra (MΩ)", "n", "notes"],
+                   colWidths=[0.40, 0.20, 0.06, 0.34],
+                   cellLoc="left", colLoc="left", loc="upper center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10.5)
+    tbl.scale(1, 1.45)
+    for (i, j), c in tbl.get_celld().items():
+        c.set_edgecolor("#bbbbbb")
+        if i == 0:
+            c.set_facecolor("#e8e8e8")
+            c.set_text_props(fontweight="bold")
+        elif rows[i - 1]["reported"]:
+            c.set_facecolor("#fff4c2")
+            c.set_text_props(fontweight="bold")
+        if j == 1 and i > 0 and not isinstance(rows[i - 1]["ra"], tuple):
+            c.get_text().set_color("#a0a0a0")       # no value: grey it out
 
 
 def _solve_ra_quadratic(Rt: float, tau: float, Cm: float,
@@ -554,6 +677,8 @@ def membrane_test_from_arrays(
                 Cm = Cm_charge * Rt / Rm if Rm > 0 else float("nan")
                 valid = bool(np.isfinite(Cm) and Cm > 0)
 
+        Ra_1090, tau_1090 = _ra_1090(t_seg, amp, dV, dI, Q1, Rt, min_r2)
+
         # two-exponential Ra: Ohm's law at the edge, I(edge) from the fit
         bx = None
         Ra_bx = tf = tsl = fsl = float("nan")
@@ -586,6 +711,7 @@ def membrane_test_from_arrays(
             fit_t0=finfo["t0"] if finfo else np.nan,
             Ra_biexp=Ra_bx, tau_fast=tf, tau_slow=tsl, frac_slow=fsl,
             biexp=dict(bx, sign=finfo["sign"]) if bx else None,
+            Ra_1090=Ra_1090, tau_1090=tau_1090,
         ))
 
     return result
@@ -953,19 +1079,17 @@ def plot_membrane_test(time_s, current_A, command_V, result,
     tms, ipA, vmV = time_s * 1e3, current_A * 1e12, command_V * 1e3
     trs = list(result.transients)[:max_edges]
     n = max(1, len(trs))
-    fig = plt.figure(figsize=(7.2 * n, 10.5))
+    fig = plt.figure(figsize=(7.2 * n, 12.5))
     gs = fig.add_gridspec(4, n, height_ratios=[1.15, 0.42, 1.35, 1.15],
-                          hspace=0.55, wspace=0.22)
+                          hspace=0.55, wspace=0.22, top=0.815)
 
-    # ---- header: Ra by BOTH methods, so the two are never confused ---------
-    # The reported numbers come from one method only; printing the other one
+    # ---- header: Ra by EVERY method, one row each, so they are never confused
+    # The reported numbers come from one method only; tabulating the others
     # beside it makes the size of the disagreement (and a quadratic that has
     # no root at all) visible at a glance instead of needing a second run.
-    fig.suptitle(format_ra_both(ra_by_both_methods(result), method=method,
-                                tau_symbol="$\\tau$") + "\n"
-                 + format_biexp(biexp_summary(result), tau_symbol="$\\tau$",
-                                mu="$\\mu$"),
-                 y=0.995, va="top", fontsize=11, fontweight="bold")
+    _draw_ra_table(fig.add_axes([0.04, 0.835, 0.92, 0.155]),
+                   ra_table_rows(result, method=method, fit_lo=fit_lo,
+                                 fit_hi=fit_hi, cross_records=cross_records))
 
     # ---- row 0: whole sweep, showing WHERE each measurement is taken --------
     axv = fig.add_subplot(gs[0, :])
@@ -1136,6 +1260,8 @@ def plot_membrane_test(time_s, current_A, command_V, result,
         if np.isfinite(tr.Ra_biexp):
             txt += (f"\nRa(2-exp) = {tr.Ra_biexp/1e6:.1f} M$\\Omega$  "
                     f"(slow {tr.frac_slow*100:.0f}%)")
+        if np.isfinite(tr.Ra_1090):
+            txt += f"\nRa($\\tau$ 10-90%) = {tr.Ra_1090/1e6:.1f} M$\\Omega$"
         if crec is not None and crec.get("plot_fit"):
             txt += f"\nRa(peak) = {crec['plot_fit']['Ra']/1e6:.1f} M$\\Omega$"
         axl.annotate(txt, (0.02, 0.03), xycoords="axes fraction", ha="left",
@@ -1384,6 +1510,7 @@ def main(argv=None):
     # opened, and this is the one place both Ra answers are guaranteed to land.
     print(format_ra_both(ra_by_both_methods(res), method=args.method))
     print(format_biexp(biexp_summary(res)))
+    print(format_1090(fit1090_summary(res)))
 
     if args.cross_check:
         import pyabf

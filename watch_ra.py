@@ -36,6 +36,11 @@ appears in the startup banner and in every launched command line this watcher
 logs, so a run's console output on its own says which one produced the Ra
 figure. See the analysis script's module docstring for the derivation of both.
 
+Whichever method is chosen, the analysis also always reports, alongside it:
+the two-exponential Ra extrapolated to the step, and the exact Ra re-solved
+with tau fitted over 10-90% of the peak (rather than the --fit window,
+default 20-80%), in both the console output and the QC figure.
+
 Usage
 -----
     # watch the Clampex data folder, run the analysis with your usual flags:
