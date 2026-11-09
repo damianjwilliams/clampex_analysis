@@ -258,7 +258,9 @@ class RunDialog(QtWidgets.QDialog):
 
     def _rescan(self) -> None:
         """Report what the chosen folder actually contains, before anything runs."""
-        if not hasattr(self, "scan_label"):
+        # Signals fire while _build_ui is still restoring saved values; wait
+        # until the whole dialog exists (the run button is made last).
+        if not hasattr(self, "run_btn"):
             return
         self.cell_list.clear()
         if not self.root or not self.root.is_dir():
