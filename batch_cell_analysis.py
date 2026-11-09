@@ -1180,7 +1180,8 @@ COLUMN_ORDER = [
     # sEPSCs, from the gap-free recording
     "sepsc_n_events", "sepsc_rate_Hz", "sepsc_duration_s",
     "sepsc_amp_median_pA", "sepsc_amp_iqr_pA", "sepsc_rise_ms", "sepsc_decay_ms",
-    "sepsc_iei_median_ms", "sepsc_noise_pA", "sepsc_detection_limit_pA",
+    "sepsc_iei_median_ms", "sepsc_noise_pA", "sepsc_line_hum_s",
+    "sepsc_detection_limit_pA",
     "sepsc_snr", "sepsc_holding_pA", "sepsc_holding_drift_pA",
     "sepsc_amp_trend_pct", "sepsc_unmeasurable", "sepsc_thresh_sd",
     "sepsc_kernel_source", "sepsc_kernel_ms", "sepsc_n_isolated",

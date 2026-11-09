@@ -73,6 +73,10 @@ SEPSC_MIN_SNR = 3.0
 # Holding current moving by more than this over the recording means the
 # amplitudes at one end are not comparable with the other.
 SEPSC_HOLD_DRIFT_PA = 20.0
+# Mains hum is subtracted before detection, and a few seconds of it is
+# routine. Past this fraction of the recording, enough of the events rest on
+# that subtraction to be worth looking at the trace.
+SEPSC_HUM_FRACTION = 0.10
 
 _app_ref = None      # keeps the QApplication alive when this module made it
 
@@ -233,6 +237,9 @@ def _flagged(summary: pd.DataFrame) -> dict[str, list[str]]:
             flag(row, f"holding drifted {hold:+.0f} pA")
         if str(row.get("sepsc_kernel_source", "")) == "analytic-fallback":
             flag(row, "sEPSC kernel not estimated from the data")
+        hum, dur = _num(row, "sepsc_line_hum_s"), _num(row, "sepsc_duration_s")
+        if np.isfinite(hum) and dur > 0 and hum / dur > SEPSC_HUM_FRACTION:
+            flag(row, f"mains hum removed from {hum:.0f} s of {dur:.0f} s")
     return out
 
 

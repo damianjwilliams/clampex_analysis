@@ -50,6 +50,11 @@ than "what is this cell doing?":
     first, and it invalidates the amplitudes either side of it.
   * ``sepsc_amp_trend_pct`` -- how far the median amplitude moved over the
     same span, which is what run-down looks like in the events themselves.
+  * ``sepsc_line_hum_s`` -- seconds of mains hum subtracted before detection.
+    Left in, hum is detected as events by the hundred and raises the noise
+    floor the whole recording's threshold is set from; it is removed (see the
+    package's ``linehum.py``), and this says how much of the trace that
+    touched.
   * ``sepsc_kernel_source`` -- whether the detector estimated the event
     waveform from this recording or fell back to its analytic one. A fallback
     means too few isolated events were found, and the detection should be
@@ -269,6 +274,7 @@ def summarise(det: dict) -> dict:
         "sepsc_iei_median_ms": _median(
             events.get("inter_event_interval_ms", pd.Series(dtype=float))),
         "sepsc_noise_pA": noise,
+        "sepsc_line_hum_s": float(getattr(trace, "line_hum_s", 0.0)),
         # 4x the noise SD: below this an event cannot be told from noise at
         # all, whatever the detector's threshold happens to be set to.
         "sepsc_detection_limit_pA": 4.0 * noise if np.isfinite(noise) else float("nan"),
