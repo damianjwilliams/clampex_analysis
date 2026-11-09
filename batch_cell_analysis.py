@@ -80,6 +80,14 @@ and quoting sag at a fixed potential is what makes it comparable between
 cells. A cell whose sweeps never reach the target is reported at its nearest
 peak voltage with ``sag_bracketed`` = False.
 
+V_peak is the mean over one mains period (1/60 s) centred on the most
+hyperpolarized point. A whole period cancels 60 Hz hum and every harmonic of
+it exactly, wherever the window falls in the cycle, and averages down the
+synaptic noise a narrower window would pick its deepest trough from. Sag
+ratios here are small (a few percent), so that noise was a large fraction of
+them -- and through the ``--rin-max-sag`` cut it also decided which sweeps
+went into Rin.
+
 Output
 ------
 Per cell, written next to the recordings under the same names the
@@ -576,6 +584,10 @@ def pick_step_files(scanned: list[dict], protocol: str = "",
 # ---------------------------------------------------------------------------
 # Subthreshold measurements: sag and (sag-free) input resistance
 # ---------------------------------------------------------------------------
+#: One mains cycle, s: the window V_peak is averaged over, so line hum cancels.
+MAINS_PERIOD_S = 1.0 / 60.0
+
+
 def _mean_over(t: np.ndarray, v: np.ndarray, t0: float, t1: float) -> float:
     i0 = int(np.searchsorted(t, t0, side="left"))
     i1 = int(np.searchsorted(t, t1, side="right"))
@@ -588,7 +600,7 @@ def subthreshold_sweep_table(
     sweeps: list[dict],
     baseline_interval: float = 0.1,
     ss_interval: Optional[float] = None,
-    peak_width: float = 0.005,
+    peak_width: float = MAINS_PERIOD_S,
     spike_thresh_mV: float = -20.0,
     min_deflection_mV: float = 0.5,
 ) -> pd.DataFrame:
